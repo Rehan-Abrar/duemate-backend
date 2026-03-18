@@ -25,7 +25,7 @@ def verify_webhook_signature(request_body: bytes, signature: str) -> bool:
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
+    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me"))
 
     @app.get("/")
     def index():
@@ -43,11 +43,12 @@ def create_app() -> Flask:
             {
                 "status": "ok",
                 "utc_time": datetime.now(timezone.utc).isoformat(),
-                "mongo_configured": bool(os.getenv("MONGODB_URI")),
-                "meta_configured": bool(os.getenv("META_BEARER_TOKEN")),
+                "mongo_configured": bool(os.getenv("MONGO_URI")),
+                "meta_configured": bool(os.getenv("META_ACCESS_TOKEN")),
             }
         )
 
+    @app.get("/webhook")
     @app.get("/webhook/messages")
     def webhook_verify():
         """Handle webhook verification from Meta."""
@@ -62,6 +63,7 @@ def create_app() -> Flask:
         else:
             return "Unauthorized", 403
 
+    @app.post("/webhook")
     @app.post("/webhook/messages")
     def webhook_receive():
         """Handle incoming WhatsApp messages from Meta."""
