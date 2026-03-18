@@ -5,6 +5,7 @@ import hashlib
 import json
 
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 
 
 def verify_webhook_signature(request_body: bytes, signature: str) -> bool:
@@ -26,6 +27,7 @@ def verify_webhook_signature(request_body: bytes, signature: str) -> bool:
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me"))
+    CORS(app)
 
     @app.get("/")
     def index():
