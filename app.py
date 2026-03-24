@@ -340,12 +340,12 @@ def create_app() -> Flask:
             return jsonify({"error": "database_not_configured"}), 503
 
         try:
-            ensure_mongo_indexes()
             limit = int(request.args.get("limit", "20"))
         except ValueError:
             limit = 20
         limit = max(1, min(limit, 100))
         try:
+            ensure_mongo_indexes()
             cursor = db.messages.find({}, {"_id": 0}).sort("received_at", -1).limit(limit)
             items = [_serialize_for_json(doc) for doc in cursor]
             return jsonify({"items": items, "count": len(items)})
