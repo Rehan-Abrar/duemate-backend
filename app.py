@@ -1,9 +1,10 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hmac
 import hashlib
 import json
 import logging
+import secrets
 import uuid
 from typing import Optional
 
@@ -13,6 +14,7 @@ from bson import ObjectId
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 import requests
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from utils.parse_task import SEMESTER_COURSES, parse_task
 
@@ -67,6 +69,156 @@ def _parse_due_date_value(value: str) -> Optional[datetime]:
 
 def _build_user_id(phone_number: str) -> str:
     return f"wa:{phone_number}"
+
+
+def _normalize_phone_number(value: str) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits
+
+
+def _parse_bool_arg(name: str) -> Optional[bool]:
+    raw_value = request.args.get(name, "").strip().lower()
+    if raw_value in {"true", "false"}:
+        return raw_value == "true"
+    return None
+
+
+def _extract_session_token() -> str:
+    auth_header = request.headers.get("Authorization", "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return request.headers.get("X-Session-Token", "").strip()
+
+
+def _hash_session_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _session_ttl_days() -> int:
+    raw_value = get_env("SESSION_TTL_DAYS", default="14").strip()
+    try:
+        days = int(raw_value)
+    except ValueError:
+        days = 14
+    return max(1, min(days, 60))
+
+
+def _create_user_session(db, user_id: str) -> tuple[str, datetime]:
+    token = secrets.token_urlsafe(36)
+    now = _utc_now()
+    expires_at = now + timedelta(days=_session_ttl_days())
+    db.user_sessions.insert_one(
+        {
+            "user_id": user_id,
+            "token_hash": _hash_session_token(token),
+            "created_at": now,
+            "last_seen": now,
+            "expires_at": expires_at,
+            "revoked_at": None,
+        }
+    )
+    return token, expires_at
+
+
+def _resolve_authenticated_user(db):
+    token = _extract_session_token()
+    if not token:
+        return None, None
+
+    session = db.user_sessions.find_one(
+        {
+            "token_hash": _hash_session_token(token),
+            "revoked_at": None,
+            "expires_at": {"$gt": _utc_now()},
+        }
+    )
+    if not session:
+        return None, None
+
+    user = db.users.find_one({"user_id": session.get("user_id")})
+    if not user:
+        return None, None
+
+    db.user_sessions.update_one(
+        {"_id": session["_id"]},
+        {"$set": {"last_seen": _utc_now()}},
+    )
+    return user, session
+
+
+def _task_filter_query_for_request(user_id: str) -> tuple[dict, int]:
+    query = {"user_id": user_id}
+
+    task_type = request.args.get("type", "").strip().lower()
+    if task_type in {"assignment", "quiz", "exam"}:
+        query["task_type"] = task_type
+
+    status = request.args.get("status", "").strip().lower()
+    if status in {"pending", "completed", "needs_review"}:
+        query["status"] = status
+
+    needs_review = _parse_bool_arg("needs_review")
+    if needs_review is not None:
+        query["needs_review"] = needs_review
+
+    course_unresolved = _parse_bool_arg("course_unresolved")
+    if course_unresolved is not None:
+        query["course_unresolved"] = course_unresolved
+
+    try:
+        limit = int(request.args.get("limit", "50"))
+    except ValueError:
+        limit = 50
+    limit = max(1, min(limit, 200))
+
+    return query, limit
+
+
+def _task_sort_key(task: dict):
+    status_value = str(task.get("status") or "pending")
+    completed_rank = 1 if status_value == "completed" else 0
+    unresolved_rank = 0 if bool(task.get("course_unresolved")) else 1
+    review_rank = 0 if bool(task.get("needs_review")) else 1
+
+    due_value = task.get("parsed_due_date")
+    due_rank = 1
+    due_sort_value = datetime.max.replace(tzinfo=timezone.utc)
+    if isinstance(due_value, datetime):
+        due_rank = 0
+        due_sort_value = due_value
+
+    created_value = task.get("created_at")
+    created_timestamp = 0.0
+    if isinstance(created_value, datetime):
+        created_timestamp = created_value.timestamp()
+
+    return (completed_rank, unresolved_rank, review_rank, due_rank, due_sort_value, -created_timestamp)
+
+
+def _serialize_user_profile(user: dict) -> dict:
+    return {
+        "user_id": user.get("user_id", ""),
+        "phone_number": user.get("phone_number", ""),
+        "last_seen": _serialize_for_json(user.get("last_seen")),
+        "created_at": _serialize_for_json(user.get("created_at")),
+        "settings": _serialize_for_json(user.get("settings", {})),
+    }
+
+
+def _get_admin_key() -> str:
+    return get_env("ADMIN_API_KEY", "ADMIN_KEY", default="")
+
+
+def _verify_admin_key() -> tuple[bool, Optional[tuple]]:
+    admin_key = _get_admin_key()
+    if not admin_key:
+        return False, (jsonify({"error": "admin_key_not_configured"}), 503)
+
+    auth_header = request.headers.get("X-Admin-Key", "").strip()
+    if not auth_header or auth_header != admin_key:
+        return False, (jsonify({"error": "forbidden"}), 403)
+
+    return True, None
 
 
 def _derive_source_key(message: dict) -> tuple[str, bool, str]:
@@ -146,6 +298,11 @@ def ensure_mongo_indexes() -> None:
     db.contacts.create_index("wa_id", unique=True)
     db.users.create_index("user_id", unique=True)
     db.users.create_index("phone_number", unique=True)
+    db.users.create_index("password_set")
+    db.user_sessions.create_index("token_hash", unique=True)
+    db.user_sessions.create_index("user_id")
+    db.user_sessions.create_index("expires_at")
+    db.user_sessions.create_index("revoked_at")
     db.tasks.create_index("user_id")
     db.tasks.create_index("status")
     db.tasks.create_index("needs_review")
@@ -485,8 +642,138 @@ def create_app() -> Flask:
             }
         )
 
+    def resolve_authenticated_user_or_401(db):
+        user, session = _resolve_authenticated_user(db)
+        if user is None or session is None:
+            return None, None, (jsonify({"error": "unauthorized"}), 401)
+        return user, session, None
+
+    @app.post("/api/auth/signup")
+    def auth_signup():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        data = request.get_json(silent=True) or {}
+        phone_number = _normalize_phone_number(data.get("phone_number", ""))
+        password = str(data.get("password", ""))
+
+        if not phone_number:
+            return jsonify({"error": "phone_number_required"}), 400
+        if len(password) < 8:
+            return jsonify({"error": "password_too_short", "minimum_length": 8}), 400
+
+        ensure_mongo_indexes()
+        user_id = _build_user_id(phone_number)
+        existing = db.users.find_one({"user_id": user_id})
+        if existing and existing.get("password_hash"):
+            return jsonify({"error": "account_already_exists"}), 409
+
+        now = _utc_now()
+        password_hash = generate_password_hash(password)
+        db.users.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "user_id": user_id,
+                    "phone_number": phone_number,
+                    "password_hash": password_hash,
+                    "password_set": True,
+                    "updated_at": now,
+                    "last_seen": now,
+                },
+                "$setOnInsert": {
+                    "created_at": now,
+                    "settings": {
+                        "timezone": "UTC",
+                        "reminder_enabled": True,
+                        "notification_preference": "all",
+                        "whatsapp_reminders_enabled": False,
+                    },
+                },
+            },
+            upsert=True,
+        )
+
+        user = db.users.find_one({"user_id": user_id})
+        token, expires_at = _create_user_session(db, user_id)
+        return jsonify(
+            {
+                "token": token,
+                "expires_at": _serialize_for_json(expires_at),
+                "user": _serialize_user_profile(user or {}),
+            }
+        ), 201
+
+    @app.post("/api/auth/login")
+    def auth_login():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        data = request.get_json(silent=True) or {}
+        phone_number = _normalize_phone_number(data.get("phone_number", ""))
+        password = str(data.get("password", ""))
+
+        if not phone_number or not password:
+            return jsonify({"error": "credentials_required"}), 400
+
+        user = db.users.find_one({"user_id": _build_user_id(phone_number)})
+        password_hash = str((user or {}).get("password_hash") or "")
+        if not user or not password_hash or not check_password_hash(password_hash, password):
+            return jsonify({"error": "invalid_credentials"}), 401
+
+        token, expires_at = _create_user_session(db, user.get("user_id", ""))
+        return jsonify(
+            {
+                "token": token,
+                "expires_at": _serialize_for_json(expires_at),
+                "user": _serialize_user_profile(user),
+            }
+        )
+
+    @app.post("/api/auth/logout")
+    def auth_logout():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        _, session, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        db.user_sessions.update_one(
+            {"_id": session["_id"]},
+            {"$set": {"revoked_at": _utc_now(), "updated_at": _utc_now()}},
+        )
+        return jsonify({"ok": True})
+
+    @app.get("/api/auth/me")
+    def auth_me():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, session, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        return jsonify(
+            {
+                "user": _serialize_user_profile(user),
+                "session": {
+                    "expires_at": _serialize_for_json(session.get("expires_at")),
+                    "last_seen": _serialize_for_json(session.get("last_seen")),
+                },
+            }
+        )
+
     @app.get("/api/messages/recent")
     def recent_messages():
+        ok, error_response = _verify_admin_key()
+        if not ok:
+            return error_response
+
         db = get_mongo_db()
         if db is None:
             return jsonify({"error": "database_not_configured"}), 503
@@ -507,6 +794,10 @@ def create_app() -> Flask:
 
     @app.get("/api/delivery-status")
     def delivery_status():
+        ok, error_response = _verify_admin_key()
+        if not ok:
+            return error_response
+
         db = get_mongo_db()
         if db is None:
             return jsonify({"error": "database_not_configured"}), 503
@@ -551,6 +842,12 @@ def create_app() -> Flask:
         if db is None:
             return jsonify({"error": "database_not_configured"}), 503
 
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+        if str(user.get("user_id") or "") != user_id:
+            return jsonify({"error": "forbidden"}), 403
+
         try:
             ensure_mongo_indexes()
             query = {"user_id": user_id}
@@ -582,6 +879,10 @@ def create_app() -> Flask:
 
     @app.get("/api/tasks")
     def list_tasks():
+        ok, error_response = _verify_admin_key()
+        if not ok:
+            return error_response
+
         db = get_mongo_db()
         if db is None:
             return jsonify({"error": "database_not_configured"}), 503
@@ -616,6 +917,307 @@ def create_app() -> Flask:
         except Exception as exc:
             app.logger.exception("list_tasks_failed error=%s", str(exc))
             return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    @app.get("/api/student/tasks")
+    def list_student_tasks():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        try:
+            ensure_mongo_indexes()
+            query, limit = _task_filter_query_for_request(user.get("user_id", ""))
+            raw_items = list(db.tasks.find(query))
+            raw_items.sort(key=_task_sort_key)
+            items = [_serialize_for_json(doc) for doc in raw_items[:limit]]
+
+            return jsonify(
+                {
+                    "items": items,
+                    "count": len(items),
+                    "scope": "student",
+                    "user_id": user.get("user_id", ""),
+                }
+            )
+        except Exception as exc:
+            app.logger.exception("list_student_tasks_failed error=%s", str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    @app.patch("/api/student/tasks/<task_id>/status")
+    def update_student_task_status(task_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        oid = _parse_object_id(task_id)
+        if oid is None:
+            return jsonify({"error": "invalid_task_id"}), 400
+
+        data = request.get_json(silent=True) or {}
+        new_status = str(data.get("status", "")).strip().lower()
+        if new_status not in {"pending", "completed", "needs_review"}:
+            return jsonify({"error": "invalid_status"}), 400
+
+        result = db.tasks.update_one(
+            {"_id": oid, "user_id": user.get("user_id", "")},
+            {
+                "$set": {
+                    "status": new_status,
+                    "needs_review": new_status == "needs_review",
+                    "updated_at": _utc_now(),
+                }
+            },
+        )
+        if result.matched_count == 0:
+            return jsonify({"error": "task_not_found"}), 404
+
+        updated = db.tasks.find_one({"_id": oid, "user_id": user.get("user_id", "")})
+        return jsonify({"item": _serialize_for_json(updated)})
+
+    @app.patch("/api/student/tasks/<task_id>")
+    def update_student_task(task_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        oid = _parse_object_id(task_id)
+        if oid is None:
+            return jsonify({"error": "invalid_task_id"}), 400
+
+        data = request.get_json(silent=True) or {}
+        allowed_fields = {
+            "task_type",
+            "parsed_course",
+            "parsed_title",
+            "quiz_material",
+            "quiz_duration",
+            "quiz_time",
+            "status",
+            "needs_review",
+        }
+        update_doc = {key: data[key] for key in allowed_fields if key in data}
+
+        if "parsed_due_date" in data:
+            parsed_due_date = _parse_due_date_value(str(data.get("parsed_due_date", "")))
+            if str(data.get("parsed_due_date", "")).strip() and parsed_due_date is None:
+                return jsonify({"error": "invalid_parsed_due_date"}), 400
+            update_doc["parsed_due_date"] = parsed_due_date
+
+        if not update_doc:
+            return jsonify({"error": "no_updatable_fields"}), 400
+
+        update_doc["corrected_at"] = _utc_now()
+        update_doc["updated_at"] = _utc_now()
+        if "needs_review" not in update_doc:
+            update_doc["needs_review"] = False
+        if "status" not in update_doc and not update_doc["needs_review"]:
+            update_doc["status"] = "pending"
+
+        result = db.tasks.update_one(
+            {"_id": oid, "user_id": user.get("user_id", "")},
+            {"$set": update_doc},
+        )
+        if result.matched_count == 0:
+            return jsonify({"error": "task_not_found"}), 404
+
+        updated = db.tasks.find_one({"_id": oid, "user_id": user.get("user_id", "")})
+        return jsonify({"item": _serialize_for_json(updated)})
+
+    @app.post("/api/student/tasks/<task_id>/confirm")
+    def confirm_student_task(task_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        oid = _parse_object_id(task_id)
+        if oid is None:
+            return jsonify({"error": "invalid_task_id"}), 400
+
+        result = db.tasks.update_one(
+            {"_id": oid, "user_id": user.get("user_id", "")},
+            {
+                "$set": {
+                    "needs_review": False,
+                    "status": "pending",
+                    "course_unresolved": False,
+                    "course_resolution_method": "manual",
+                    "corrected_at": _utc_now(),
+                    "updated_at": _utc_now(),
+                }
+            },
+        )
+        if result.matched_count == 0:
+            return jsonify({"error": "task_not_found"}), 404
+
+        updated = db.tasks.find_one({"_id": oid, "user_id": user.get("user_id", "")})
+        return jsonify({"item": _serialize_for_json(updated)})
+
+    @app.post("/api/student/tasks/<task_id>/assign-course")
+    def assign_student_task_course(task_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        oid = _parse_object_id(task_id)
+        if oid is None:
+            return jsonify({"error": "invalid_task_id"}), 400
+
+        data = request.get_json(silent=True) or {}
+        course_code = str(data.get("course_code", "")).strip().upper()
+        apply_to_source = bool(data.get("apply_to_source", False))
+        if not course_code:
+            return jsonify({"error": "course_code_required"}), 400
+
+        task = db.tasks.find_one({"_id": oid, "user_id": user.get("user_id", "")})
+        if not task:
+            return jsonify({"error": "task_not_found"}), 404
+
+        db.tasks.update_one(
+            {"_id": oid, "user_id": user.get("user_id", "")},
+            {
+                "$set": {
+                    "parsed_course": course_code,
+                    "course_unresolved": False,
+                    "course_resolution_method": "manual",
+                    "needs_review": False,
+                    "status": "pending",
+                    "corrected_at": _utc_now(),
+                    "updated_at": _utc_now(),
+                }
+            },
+        )
+
+        mapping_saved = False
+        source_key = str(task.get("source_key") or "")
+        user_id = str(user.get("user_id") or "")
+        if apply_to_source and source_key and source_key != "forwarded:unknown" and user_id:
+            db.course_source_mappings.update_one(
+                {"user_id": user_id, "source_key": source_key},
+                {
+                    "$set": {
+                        "user_id": user_id,
+                        "source_key": source_key,
+                        "course_code": course_code,
+                        "updated_at": _utc_now(),
+                    },
+                    "$setOnInsert": {"created_at": _utc_now()},
+                },
+                upsert=True,
+            )
+            mapping_saved = True
+
+        updated = db.tasks.find_one({"_id": oid, "user_id": user.get("user_id", "")})
+        return jsonify({"item": _serialize_for_json(updated), "mapping_saved": mapping_saved})
+
+    @app.get("/api/student/course-mappings")
+    def get_student_course_mappings():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        user_id = str(user.get("user_id") or "")
+        items = [
+            _serialize_for_json(doc)
+            for doc in db.course_source_mappings.find({"user_id": user_id}, {"_id": 0}).sort("updated_at", -1)
+        ]
+        return jsonify({"items": items, "count": len(items)})
+
+    @app.post("/api/student/course-mappings")
+    def upsert_student_course_mapping():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        data = request.get_json(silent=True) or {}
+        source_key = str(data.get("source_key", "")).strip()
+        course_code = str(data.get("course_code", "")).strip().upper()
+        if not source_key:
+            return jsonify({"error": "source_key_required"}), 400
+        if not course_code:
+            return jsonify({"error": "course_code_required"}), 400
+
+        user_id = str(user.get("user_id") or "")
+        doc = {
+            "user_id": user_id,
+            "source_key": source_key,
+            "course_code": course_code,
+            "updated_at": _utc_now(),
+        }
+        db.course_source_mappings.update_one(
+            {"user_id": user_id, "source_key": source_key},
+            {"$set": doc, "$setOnInsert": {"created_at": _utc_now()}},
+            upsert=True,
+        )
+        return jsonify({"item": _serialize_for_json(doc)})
+
+    @app.delete("/api/student/course-mappings")
+    def delete_student_course_mapping():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        source_key = request.args.get("source_key", "").strip()
+        if not source_key:
+            return jsonify({"error": "source_key_required"}), 400
+
+        user_id = str(user.get("user_id") or "")
+        result = db.course_source_mappings.delete_one({"user_id": user_id, "source_key": source_key})
+        return jsonify({"deleted": result.deleted_count > 0, "source_key": source_key})
+
+    @app.get("/api/student/reminders")
+    def list_student_reminders():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        now = _utc_now()
+        soon_boundary = now + timedelta(hours=48)
+        query = {
+            "user_id": user.get("user_id", ""),
+            "status": {"$ne": "completed"},
+            "parsed_due_date": {"$gte": now, "$lte": soon_boundary},
+        }
+        items = [
+            _serialize_for_json(doc)
+            for doc in db.tasks.find(query).sort([("parsed_due_date", 1), ("created_at", -1)]).limit(25)
+        ]
+        return jsonify({"items": items, "count": len(items), "window_hours": 48})
 
     @app.get("/api/courses/default")
     def default_courses():
@@ -787,6 +1389,12 @@ def create_app() -> Flask:
         if db is None:
             return jsonify({"error": "database_not_configured"}), 503
 
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+        if str(user.get("user_id") or "") != user_id:
+            return jsonify({"error": "forbidden"}), 403
+
         try:
             ensure_mongo_indexes()
             items = [
@@ -803,6 +1411,12 @@ def create_app() -> Flask:
         db = get_mongo_db()
         if db is None:
             return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+        if str(user.get("user_id") or "") != user_id:
+            return jsonify({"error": "forbidden"}), 403
 
         data = request.get_json(silent=True) or {}
         source_key = str(data.get("source_key", "")).strip()
@@ -836,6 +1450,12 @@ def create_app() -> Flask:
         db = get_mongo_db()
         if db is None:
             return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+        if str(user.get("user_id") or "") != user_id:
+            return jsonify({"error": "forbidden"}), 403
 
         source_key = request.args.get("source_key", "").strip()
         if not source_key:
