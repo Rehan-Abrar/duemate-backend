@@ -9,9 +9,12 @@ from typing import Optional
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from bson import ObjectId
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 import requests
+
+from utils.parse_task import SEMESTER_COURSES, parse_task
 
 
 _mongo_client: Optional[MongoClient] = None
@@ -34,11 +37,66 @@ def _parse_unix_timestamp(value: Optional[str]) -> datetime:
 def _serialize_for_json(value):
     if isinstance(value, datetime):
         return value.isoformat()
+    if isinstance(value, ObjectId):
+        return str(value)
     if isinstance(value, list):
         return [_serialize_for_json(item) for item in value]
     if isinstance(value, dict):
         return {key: _serialize_for_json(val) for key, val in value.items()}
     return value
+
+
+def _parse_object_id(value: str) -> Optional[ObjectId]:
+    try:
+        return ObjectId(value)
+    except Exception:
+        return None
+
+
+def _parse_due_date_value(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _build_user_id(phone_number: str) -> str:
+    return f"wa:{phone_number}"
+
+
+def _derive_source_key(message: dict) -> tuple[str, bool, str]:
+    context = message.get("context", {}) if isinstance(message, dict) else {}
+    is_forwarded = bool(context.get("forwarded"))
+    forwarded_from = str(context.get("forwarded_from") or "").strip()
+
+    if is_forwarded and forwarded_from:
+        return f"forwarded:{forwarded_from}", True, forwarded_from
+    if is_forwarded:
+        return "forwarded:unknown", True, ""
+    return "direct", False, ""
+
+
+def _resolve_course_from_mapping(db, user_id: str, source_key: str) -> Optional[str]:
+    if not user_id or not source_key:
+        return None
+
+    mapping = db.course_source_mappings.find_one({"user_id": user_id, "source_key": source_key}, {"_id": 0, "course_code": 1})
+    if mapping:
+        return str(mapping.get("course_code") or "").strip().upper() or None
+    return None
+
+
+def _is_course_unresolved(parsed_course: Optional[str], source_key: str) -> bool:
+    if not parsed_course:
+        return True
+    if source_key == "forwarded:unknown":
+        return True
+    return False
 
 
 def get_env(primary: str, *aliases: str, default: str = "") -> str:
@@ -86,6 +144,20 @@ def ensure_mongo_indexes() -> None:
     db.messages.create_index("received_at")
     db.messages.create_index("from")
     db.contacts.create_index("wa_id", unique=True)
+    db.users.create_index("user_id", unique=True)
+    db.users.create_index("phone_number", unique=True)
+    db.tasks.create_index("user_id")
+    db.tasks.create_index("status")
+    db.tasks.create_index("needs_review")
+    db.tasks.create_index("course_unresolved")
+    db.tasks.create_index("parsed_due_date")
+    db.tasks.create_index("created_at")
+    db.tasks.create_index("source_message_id", unique=True)
+    db.tasks.create_index("source_key")
+    db.course_source_mappings.create_index([("user_id", 1), ("source_key", 1)], unique=True)
+    db.course_source_mappings.create_index("course_code")
+    db.reminders_sent.create_index("user_id")
+    db.reminders_sent.create_index("task_id")
     _indexes_ready = True
 
 
@@ -110,16 +182,16 @@ def get_mongo_connectivity_status() -> tuple[bool, str]:
 
 def verify_webhook_signature(request_body: bytes, signature: str) -> bool:
     """Verify X-Hub-Signature-256 from Meta webhook."""
-    app_secret = get_env("META_APP_SECRET")
-    if not app_secret:
+    app_secret = get_env("META_APP_SECRET", "WHATSAPP_APP_SECRET", "APP_SECRET")
+    if not app_secret or not signature:
         return False
-    
+
     expected_signature = hmac.HMAC(
         app_secret.encode(),
         request_body,
         hashlib.sha256
     ).hexdigest()
-    
+
     # Constant-time comparison to prevent timing attacks
     return hmac.compare_digest(f"sha256={expected_signature}", signature)
 
@@ -193,6 +265,9 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
         "duplicates": 0,
         "acked": 0,
         "ack_failures": 0,
+        "tasks_created": 0,
+        "tasks_needs_review": 0,
+        "tasks_missing_course_mapping": 0,
     }
 
     if db is None:
@@ -217,6 +292,7 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     continue
 
                 sender = message.get("from")
+                user_id = _build_user_id(sender) if sender else ""
                 sender_profile = contacts_map.get(sender, {}).get("profile", {}).get("name", "")
                 message_type = message.get("type", "unknown")
                 text_body = ""
@@ -224,6 +300,8 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     text_body = message.get("text", {}).get("body", "")
                 elif message_type in message and isinstance(message.get(message_type), dict):
                     text_body = json.dumps(message.get(message_type), ensure_ascii=True)
+
+                source_key, is_forwarded, forwarded_from = _derive_source_key(message)
 
                 message_doc = {
                     "message_id": message_id,
@@ -235,6 +313,9 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     "timestamp": _parse_unix_timestamp(message.get("timestamp")),
                     "received_at": _utc_now(),
                     "delivery_status": "received",
+                    "source_key": source_key,
+                    "is_forwarded": is_forwarded,
+                    "forwarded_from": forwarded_from,
                     "raw": message,
                     "request_id": request_id,
                 }
@@ -259,13 +340,82 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                         upsert=True,
                     )
 
+                    db.users.update_one(
+                        {"user_id": user_id},
+                        {
+                            "$set": {
+                                "phone_number": sender,
+                                "last_seen": _utc_now(),
+                                "updated_at": _utc_now(),
+                            },
+                            "$setOnInsert": {
+                                "user_id": user_id,
+                                "created_at": _utc_now(),
+                                "settings": {
+                                    "timezone": "UTC",
+                                    "reminder_enabled": True,
+                                    "notification_preference": "all",
+                                },
+                            },
+                        },
+                        upsert=True,
+                    )
+
+                mapped_course = _resolve_course_from_mapping(db, user_id, source_key) if user_id else None
+                parse_result = parse_task(text_body, course_hint=mapped_course)
+                task_status = "needs_review" if parse_result["needs_review"] else "pending"
+                course_unresolved = _is_course_unresolved(parse_result.get("course"), source_key)
+                course_resolution_method = "mapped" if mapped_course else ("heuristic" if parse_result.get("course") else "unresolved")
+                task_doc = {
+                    "user_id": user_id,
+                    "phone_number": sender,
+                    "task_type": parse_result["task_type"],
+                    "raw_message": text_body,
+                    "parsed_course": parse_result["course"],
+                    "parsed_title": parse_result["title"],
+                    "parsed_due_date": parse_result["due_date"],
+                    "quiz_material": parse_result["quiz_material"],
+                    "quiz_duration": parse_result["quiz_duration"],
+                    "quiz_time": parse_result["quiz_time"],
+                    "parse_confidence": parse_result["confidence"],
+                    "needs_review": parse_result["needs_review"] or course_unresolved,
+                    "status": task_status,
+                    "course_unresolved": course_unresolved,
+                    "course_resolution_method": course_resolution_method,
+                    "source_key": source_key,
+                    "is_forwarded": is_forwarded,
+                    "forwarded_from": forwarded_from,
+                    "course_mapped_from_source": bool(mapped_course),
+                    "source_message_id": message_id,
+                    "source_request_id": request_id,
+                    "created_at": _utc_now(),
+                    "updated_at": _utc_now(),
+                }
+
+                try:
+                    db.tasks.insert_one(task_doc)
+                    summary["tasks_created"] += 1
+                except DuplicateKeyError:
+                    summary["duplicates"] += 1
+
+                if parse_result["needs_review"]:
+                    summary["tasks_needs_review"] += 1
+                if course_unresolved:
+                    summary["tasks_missing_course_mapping"] += 1
+
                 summary["inbound_messages"] += 1
 
-                ack_template = get_env(
-                    "ACK_MESSAGE_TEMPLATE",
-                    default="DueMate: Message received. We will process your request shortly.",
+                dashboard_url = get_env("DASHBOARD_URL", default="")
+                ack_template = get_env("ACK_MESSAGE_TEMPLATE", default="DueMate: Task saved.")
+                review_template = get_env(
+                    "ACK_REVIEW_TEMPLATE",
+                    default="DueMate: Please review parsed details on dashboard.",
                 )
-                send_result = send_whatsapp_text_message(sender, ack_template) if sender else {"sent": False}
+                if dashboard_url:
+                    review_template = f"{review_template} {dashboard_url}"
+
+                ack_message = review_template if parse_result["needs_review"] else ack_template
+                send_result = send_whatsapp_text_message(sender, ack_message) if sender else {"sent": False}
                 if send_result.get("sent"):
                     summary["acked"] += 1
                 else:
@@ -319,6 +469,7 @@ def create_app() -> Flask:
     @app.get("/health")
     def health():
         mongo_uri = get_env("MONGODB_URI", "MONGO_URI")
+        webhook_secret = get_env("META_APP_SECRET", "WHATSAPP_APP_SECRET", "APP_SECRET")
         mongo_connected, mongo_error = (
             get_mongo_connectivity_status() if mongo_uri else (False, "mongo_uri_missing")
         )
@@ -330,6 +481,7 @@ def create_app() -> Flask:
                 "mongo_connected": mongo_connected,
                 "mongo_error": "" if mongo_connected else mongo_error,
                 "meta_configured": bool(get_env("META_BEARER_TOKEN", "META_ACCESS_TOKEN")),
+                "webhook_signature_ready": bool(webhook_secret),
             }
         )
 
@@ -393,6 +545,301 @@ def create_app() -> Flask:
             app.logger.exception("delivery_status_failed error=%s", str(exc))
             return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
 
+    @app.get("/api/tasks/<user_id>")
+    def get_tasks_for_user(user_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        try:
+            ensure_mongo_indexes()
+            query = {"user_id": user_id}
+
+            task_type = request.args.get("type", "").strip().lower()
+            if task_type in {"assignment", "quiz", "exam"}:
+                query["task_type"] = task_type
+
+            status = request.args.get("status", "").strip().lower()
+            if status in {"pending", "completed", "needs_review"}:
+                query["status"] = status
+
+            needs_review_param = request.args.get("needs_review", "").strip().lower()
+            if needs_review_param in {"true", "false"}:
+                query["needs_review"] = needs_review_param == "true"
+
+            course_unresolved_param = request.args.get("course_unresolved", "").strip().lower()
+            if course_unresolved_param in {"true", "false"}:
+                query["course_unresolved"] = course_unresolved_param == "true"
+
+            items = [
+                _serialize_for_json(doc)
+                for doc in db.tasks.find(query).sort([("parsed_due_date", 1), ("created_at", -1)])
+            ]
+            return jsonify({"items": items, "count": len(items)})
+        except Exception as exc:
+            app.logger.exception("get_tasks_for_user_failed user_id=%s error=%s", user_id, str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    @app.get("/api/tasks")
+    def list_tasks():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        try:
+            ensure_mongo_indexes()
+            query = {}
+
+            user_id = request.args.get("user_id", "").strip()
+            if user_id:
+                query["user_id"] = user_id
+
+            needs_review_param = request.args.get("needs_review", "").strip().lower()
+            if needs_review_param in {"true", "false"}:
+                query["needs_review"] = needs_review_param == "true"
+
+            try:
+                limit = int(request.args.get("limit", "50"))
+            except ValueError:
+                limit = 50
+            limit = max(1, min(limit, 200))
+
+            items = [
+                _serialize_for_json(doc)
+                for doc in db.tasks.find(query).sort([("created_at", -1)]).limit(limit)
+            ]
+            return jsonify({"items": items, "count": len(items)})
+        except Exception as exc:
+            app.logger.exception("list_tasks_failed error=%s", str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    @app.get("/api/courses/default")
+    def default_courses():
+        return jsonify({"items": SEMESTER_COURSES, "count": len(SEMESTER_COURSES)})
+
+    @app.patch("/api/tasks/<task_id>/status")
+    def update_task_status(task_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        oid = _parse_object_id(task_id)
+        if oid is None:
+            return jsonify({"error": "invalid_task_id"}), 400
+
+        data = request.get_json(silent=True) or {}
+        new_status = str(data.get("status", "")).strip().lower()
+        if new_status not in {"pending", "completed", "needs_review"}:
+            return jsonify({"error": "invalid_status"}), 400
+
+        update_doc = {
+            "status": new_status,
+            "needs_review": new_status == "needs_review",
+            "updated_at": _utc_now(),
+        }
+
+        result = db.tasks.update_one({"_id": oid}, {"$set": update_doc})
+        if result.matched_count == 0:
+            return jsonify({"error": "task_not_found"}), 404
+
+        updated = db.tasks.find_one({"_id": oid})
+        return jsonify({"item": _serialize_for_json(updated)})
+
+    @app.patch("/api/tasks/<task_id>")
+    def update_task(task_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        oid = _parse_object_id(task_id)
+        if oid is None:
+            return jsonify({"error": "invalid_task_id"}), 400
+
+        data = request.get_json(silent=True) or {}
+        allowed_fields = {
+            "task_type",
+            "parsed_course",
+            "parsed_title",
+            "quiz_material",
+            "quiz_duration",
+            "quiz_time",
+            "status",
+            "needs_review",
+        }
+        update_doc = {key: data[key] for key in allowed_fields if key in data}
+
+        if "parsed_due_date" in data:
+            parsed_due_date = _parse_due_date_value(str(data.get("parsed_due_date", "")))
+            if str(data.get("parsed_due_date", "")).strip() and parsed_due_date is None:
+                return jsonify({"error": "invalid_parsed_due_date"}), 400
+            update_doc["parsed_due_date"] = parsed_due_date
+
+        if not update_doc:
+            return jsonify({"error": "no_updatable_fields"}), 400
+
+        update_doc["corrected_at"] = _utc_now()
+        update_doc["updated_at"] = _utc_now()
+
+        if "needs_review" not in update_doc:
+            update_doc["needs_review"] = False
+        if "status" not in update_doc and not update_doc["needs_review"]:
+            update_doc["status"] = "pending"
+
+        result = db.tasks.update_one({"_id": oid}, {"$set": update_doc})
+        if result.matched_count == 0:
+            return jsonify({"error": "task_not_found"}), 404
+
+        updated = db.tasks.find_one({"_id": oid})
+        return jsonify({"item": _serialize_for_json(updated)})
+
+    @app.post("/api/tasks/<task_id>/confirm")
+    def confirm_task(task_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        oid = _parse_object_id(task_id)
+        if oid is None:
+            return jsonify({"error": "invalid_task_id"}), 400
+
+        result = db.tasks.update_one(
+            {"_id": oid},
+            {
+                "$set": {
+                    "needs_review": False,
+                    "status": "pending",
+                    "course_unresolved": False,
+                    "course_resolution_method": "manual",
+                    "corrected_at": _utc_now(),
+                    "updated_at": _utc_now(),
+                }
+            },
+        )
+        if result.matched_count == 0:
+            return jsonify({"error": "task_not_found"}), 404
+
+        updated = db.tasks.find_one({"_id": oid})
+        return jsonify({"item": _serialize_for_json(updated)})
+
+    @app.post("/api/tasks/<task_id>/assign-course")
+    def assign_task_course(task_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        oid = _parse_object_id(task_id)
+        if oid is None:
+            return jsonify({"error": "invalid_task_id"}), 400
+
+        data = request.get_json(silent=True) or {}
+        course_code = str(data.get("course_code", "")).strip()
+        apply_to_source = bool(data.get("apply_to_source", False))
+
+        if not course_code:
+            return jsonify({"error": "course_code_required"}), 400
+
+        task = db.tasks.find_one({"_id": oid})
+        if not task:
+            return jsonify({"error": "task_not_found"}), 404
+
+        update_doc = {
+            "parsed_course": course_code,
+            "course_unresolved": False,
+            "course_resolution_method": "manual",
+            "needs_review": False,
+            "status": "pending",
+            "corrected_at": _utc_now(),
+            "updated_at": _utc_now(),
+        }
+        db.tasks.update_one({"_id": oid}, {"$set": update_doc})
+
+        mapping_saved = False
+        source_key = str(task.get("source_key") or "")
+        user_id = str(task.get("user_id") or "")
+        if apply_to_source and source_key and source_key != "forwarded:unknown" and user_id:
+            db.course_source_mappings.update_one(
+                {"user_id": user_id, "source_key": source_key},
+                {
+                    "$set": {
+                        "user_id": user_id,
+                        "source_key": source_key,
+                        "course_code": course_code,
+                        "updated_at": _utc_now(),
+                    },
+                    "$setOnInsert": {
+                        "created_at": _utc_now(),
+                    },
+                },
+                upsert=True,
+            )
+            mapping_saved = True
+
+        updated = db.tasks.find_one({"_id": oid})
+        return jsonify({"item": _serialize_for_json(updated), "mapping_saved": mapping_saved})
+
+    @app.get("/api/course-mappings/<user_id>")
+    def get_course_mappings(user_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        try:
+            ensure_mongo_indexes()
+            items = [
+                _serialize_for_json(doc)
+                for doc in db.course_source_mappings.find({"user_id": user_id}, {"_id": 0}).sort("updated_at", -1)
+            ]
+            return jsonify({"items": items, "count": len(items)})
+        except Exception as exc:
+            app.logger.exception("get_course_mappings_failed user_id=%s error=%s", user_id, str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    @app.post("/api/course-mappings/<user_id>")
+    def upsert_course_mapping(user_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        data = request.get_json(silent=True) or {}
+        source_key = str(data.get("source_key", "")).strip()
+        course_code = str(data.get("course_code", "")).strip().upper()
+
+        if not source_key:
+            return jsonify({"error": "source_key_required"}), 400
+        if not course_code:
+            return jsonify({"error": "course_code_required"}), 400
+
+        doc = {
+            "user_id": user_id,
+            "source_key": source_key,
+            "course_code": course_code,
+            "updated_at": _utc_now(),
+        }
+        db.course_source_mappings.update_one(
+            {"user_id": user_id, "source_key": source_key},
+            {
+                "$set": doc,
+                "$setOnInsert": {
+                    "created_at": _utc_now(),
+                },
+            },
+            upsert=True,
+        )
+        return jsonify({"item": _serialize_for_json(doc)})
+
+    @app.delete("/api/course-mappings/<user_id>")
+    def delete_course_mapping(user_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        source_key = request.args.get("source_key", "").strip()
+        if not source_key:
+            return jsonify({"error": "source_key_required"}), 400
+
+        result = db.course_source_mappings.delete_one({"user_id": user_id, "source_key": source_key})
+        return jsonify({"deleted": result.deleted_count > 0, "source_key": source_key})
+
     @app.get("/webhook")
     @app.get("/webhook/messages")
     def webhook_verify():
@@ -417,7 +864,12 @@ def create_app() -> Flask:
         # Verify signature
         signature = request.headers.get("X-Hub-Signature-256", "")
         if not verify_webhook_signature(request.data, signature):
-            app.logger.warning("webhook_signature_invalid request_id=%s", request_id)
+            app.logger.warning(
+                "webhook_signature_invalid request_id=%s signature_present=%s secret_configured=%s",
+                request_id,
+                bool(signature),
+                bool(get_env("META_APP_SECRET", "WHATSAPP_APP_SECRET", "APP_SECRET")),
+            )
             return jsonify({"error": "Invalid signature"}), 401
 
         try:
