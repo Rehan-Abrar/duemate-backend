@@ -91,14 +91,21 @@ def ensure_mongo_indexes() -> None:
 
 def check_mongo_connectivity() -> bool:
     """Ping MongoDB to verify network/auth connectivity."""
+    ok, _ = get_mongo_connectivity_status()
+    return ok
+
+
+def get_mongo_connectivity_status() -> tuple[bool, str]:
+    """Return mongo connectivity status and a safe error hint for diagnostics."""
     try:
         client = get_mongo_client()
         if client is None:
-            return False
+            return False, "mongo_uri_missing"
         client.admin.command("ping")
-        return True
-    except Exception:
-        return False
+        return True, ""
+    except Exception as exc:
+        # Keep the error safe and compact for health/debugging without leaking secrets.
+        return False, exc.__class__.__name__
 
 
 def verify_webhook_signature(request_body: bytes, signature: str) -> bool:
@@ -312,13 +319,16 @@ def create_app() -> Flask:
     @app.get("/health")
     def health():
         mongo_uri = get_env("MONGODB_URI", "MONGO_URI")
-        mongo_connected = check_mongo_connectivity() if mongo_uri else False
+        mongo_connected, mongo_error = (
+            get_mongo_connectivity_status() if mongo_uri else (False, "mongo_uri_missing")
+        )
         return jsonify(
             {
                 "status": "ok",
                 "utc_time": datetime.now(timezone.utc).isoformat(),
                 "mongo_configured": bool(mongo_uri),
                 "mongo_connected": mongo_connected,
+                "mongo_error": "" if mongo_connected else mongo_error,
                 "meta_configured": bool(get_env("META_BEARER_TOKEN", "META_ACCESS_TOKEN")),
             }
         )
@@ -329,16 +339,19 @@ def create_app() -> Flask:
         if db is None:
             return jsonify({"error": "database_not_configured"}), 503
 
-        ensure_mongo_indexes()
         try:
+            ensure_mongo_indexes()
             limit = int(request.args.get("limit", "20"))
         except ValueError:
             limit = 20
         limit = max(1, min(limit, 100))
-
-        cursor = db.messages.find({}, {"_id": 0}).sort("received_at", -1).limit(limit)
-        items = [_serialize_for_json(doc) for doc in cursor]
-        return jsonify({"items": items, "count": len(items)})
+        try:
+            cursor = db.messages.find({}, {"_id": 0}).sort("received_at", -1).limit(limit)
+            items = [_serialize_for_json(doc) for doc in cursor]
+            return jsonify({"items": items, "count": len(items)})
+        except Exception as exc:
+            app.logger.exception("recent_messages_failed error=%s", str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
 
     @app.get("/api/delivery-status")
     def delivery_status():
@@ -346,35 +359,39 @@ def create_app() -> Flask:
         if db is None:
             return jsonify({"error": "database_not_configured"}), 503
 
-        ensure_mongo_indexes()
-        pipeline = [
-            {"$group": {"_id": "$delivery_status", "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}},
-        ]
-        summary = [
-            {"status": row.get("_id") or "unknown", "count": row.get("count", 0)}
-            for row in db.messages.aggregate(pipeline)
-        ]
+        try:
+            ensure_mongo_indexes()
+            pipeline = [
+                {"$group": {"_id": "$delivery_status", "count": {"$sum": 1}}},
+                {"$sort": {"count": -1}},
+            ]
+            summary = [
+                {"status": row.get("_id") or "unknown", "count": row.get("count", 0)}
+                for row in db.messages.aggregate(pipeline)
+            ]
 
-        recent_events_cursor = (
-            db.webhook_events.find({"event_type": "status_update"}, {"_id": 0, "payload": 1, "processed_at": 1})
-            .sort("processed_at", -1)
-            .limit(20)
-        )
-        events = []
-        for event in recent_events_cursor:
-            payload = event.get("payload", {})
-            events.append(
-                {
-                    "message_id": payload.get("id", ""),
-                    "status": payload.get("status", "unknown"),
-                    "recipient_id": payload.get("recipient_id", ""),
-                    "timestamp": _parse_unix_timestamp(payload.get("timestamp")).isoformat(),
-                    "processed_at": _serialize_for_json(event.get("processed_at")),
-                }
+            recent_events_cursor = (
+                db.webhook_events.find({"event_type": "status_update"}, {"_id": 0, "payload": 1, "processed_at": 1})
+                .sort("processed_at", -1)
+                .limit(20)
             )
+            events = []
+            for event in recent_events_cursor:
+                payload = event.get("payload", {})
+                events.append(
+                    {
+                        "message_id": payload.get("id", ""),
+                        "status": payload.get("status", "unknown"),
+                        "recipient_id": payload.get("recipient_id", ""),
+                        "timestamp": _parse_unix_timestamp(payload.get("timestamp")).isoformat(),
+                        "processed_at": _serialize_for_json(event.get("processed_at")),
+                    }
+                )
 
-        return jsonify({"summary": summary, "recent_events": events})
+            return jsonify({"summary": summary, "recent_events": events})
+        except Exception as exc:
+            app.logger.exception("delivery_status_failed error=%s", str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
 
     @app.get("/webhook")
     @app.get("/webhook/messages")
