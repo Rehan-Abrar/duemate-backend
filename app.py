@@ -598,6 +598,10 @@ def create_app() -> Flask:
             if needs_review_param in {"true", "false"}:
                 query["needs_review"] = needs_review_param == "true"
 
+            course_unresolved_param = request.args.get("course_unresolved", "").strip().lower()
+            if course_unresolved_param in {"true", "false"}:
+                query["course_unresolved"] = course_unresolved_param == "true"
+
             try:
                 limit = int(request.args.get("limit", "50"))
             except ValueError:
