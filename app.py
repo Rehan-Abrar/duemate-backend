@@ -87,7 +87,7 @@ def _parse_due_date_value(value: str) -> Optional[datetime]:
 
 
 def _build_user_id(phone_number: str) -> str:
-    return f"wa:{phone_number}"
+    return f"wa:{_normalize_phone_number(phone_number)}"
 
 
 def _build_admin_id() -> str:
@@ -140,6 +140,17 @@ def _is_greeting(text: str) -> bool:
 
 def _normalize_phone_number(value: str) -> str:
     digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if not digits:
+        return ""
+
+    # Canonicalize local Pakistani formats to international digits without '+'
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("0"):
+        digits = "92" + digits[1:]
+    elif digits.startswith("3") and len(digits) == 10:
+        digits = "92" + digits
+
     return digits
 
 
@@ -387,6 +398,55 @@ def get_env(primary: str, *aliases: str, default: str = "") -> str:
     return default
 
 
+def _normalize_dashboard_url(value: str) -> str:
+    url = str(value or "").strip()
+    if not url:
+        url = "https://duemate-dashboard.vercel.app"
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    return url.rstrip("/")
+
+
+def _migrate_legacy_user_identity(db, canonical_user_id: str, canonical_phone: str) -> None:
+    """Merge legacy +92 user_id variants into canonical digit-only user_id."""
+    legacy_user_ids = {f"wa:+{canonical_phone}"}
+    legacy_user_ids.discard(canonical_user_id)
+
+    for legacy_user_id in legacy_user_ids:
+        legacy_user = db.users.find_one({"user_id": legacy_user_id})
+        if not legacy_user:
+            continue
+
+        for collection_name in (
+            "tasks",
+            "reminders_sent",
+            "user_sessions",
+            "refresh_tokens",
+            "course_source_mappings",
+            "archived_tasks",
+            "archived_reminders_sent",
+        ):
+            db[collection_name].update_many(
+                {"user_id": legacy_user_id},
+                {"$set": {"user_id": canonical_user_id, "updated_at": _utc_now()}},
+            )
+
+        if db.users.find_one({"user_id": canonical_user_id}):
+            db.users.delete_one({"user_id": legacy_user_id})
+        else:
+            db.users.update_one(
+                {"user_id": legacy_user_id},
+                {
+                    "$set": {
+                        "user_id": canonical_user_id,
+                        "phone_number": canonical_phone,
+                        "last_seen": _utc_now(),
+                        "updated_at": _utc_now(),
+                    }
+                },
+            )
+
+
 def get_mongo_client() -> Optional[MongoClient]:
     """Create and cache MongoDB client if URI is configured."""
     global _mongo_client
@@ -590,7 +650,8 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     continue
 
                 sender = message.get("from")
-                user_id = _build_user_id(sender) if sender else ""
+                normalized_sender = _normalize_phone_number(sender)
+                user_id = _build_user_id(normalized_sender) if normalized_sender else ""
                 sender_profile = contacts_map.get(sender, {}).get("profile", {}).get("name", "")
                 message_type = message.get("type", "unknown")
                 text_body = ""
@@ -647,7 +708,7 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                         {"user_id": user_id},
                         {
                             "$set": {
-                                "phone_number": sender,
+                                "phone_number": normalized_sender,
                                 "last_seen": _utc_now(),
                                 "updated_at": _utc_now(),
                             },
@@ -674,7 +735,7 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     # Send friendly greeting response
                     try:
                         send_text_message(
-                            to_number=sender,
+                            to_number=normalized_sender or sender,
                             message_body="Hey! Send me your assignment or quiz details and I will save them for you.",
                             preview_url=False
                         )
@@ -703,7 +764,7 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                 
                 task_doc = {
                     "user_id": user_id,
-                    "phone_number": sender,
+                    "phone_number": normalized_sender or sender,
                     "task_type": parse_result["task_type"],
                     "raw_message": text_body,
                     "fingerprint": fingerprint,
@@ -745,10 +806,12 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                 summary["inbound_messages"] += 1
 
                 # Send acknowledgment via WhatsApp using enhanced messages
-                dashboard_url = get_env("DASHBOARD_URL", default="")
+                dashboard_url = _normalize_dashboard_url(
+                    get_env("DASHBOARD_URL", default="https://duemate-dashboard.vercel.app")
+                )
                 
                 send_result = send_task_acknowledgment(
-                    to_phone=sender,
+                    to_phone=normalized_sender or sender,
                     task_type=parse_result["task_type"],
                     course=parse_result.get("course"),
                     due_date=parse_result.get("due_date"),
@@ -1049,17 +1112,10 @@ def create_app() -> Flask:
             return make_error_response("database_not_configured", status_code=503)
         
         data = request.get_json(silent=True) or {}
-        phone_number = str(data.get("phone_number", "")).strip()
+        phone_number = _normalize_phone_number(data.get("phone_number", ""))
         
         if not phone_number:
             return make_error_response("phone_number_required", status_code=400)
-        
-        # Normalize phone number
-        if not phone_number.startswith("+"):
-            if phone_number.startswith("0"):
-                phone_number = "+92" + phone_number[1:]
-            else:
-                phone_number = "+92" + phone_number
         
         try:
             # Create OTP and store in database
@@ -1101,7 +1157,7 @@ def create_app() -> Flask:
             return make_error_response("database_not_configured", status_code=503)
         
         data = request.get_json(silent=True) or {}
-        phone_number = str(data.get("phone_number", "")).strip()
+        phone_number = _normalize_phone_number(data.get("phone_number", ""))
         otp_code = str(data.get("otp", "")).strip()
         
         if not phone_number or not otp_code:
@@ -1110,13 +1166,6 @@ def create_app() -> Flask:
                 message="Phone number and OTP are required.",
                 status_code=400
             )
-        
-        # Normalize phone number
-        if not phone_number.startswith("+"):
-            if phone_number.startswith("0"):
-                phone_number = "+92" + phone_number[1:]
-            else:
-                phone_number = "+92" + phone_number
         
         try:
             # Verify OTP
@@ -1128,6 +1177,9 @@ def create_app() -> Flask:
             # Get or create user
             user_id = _build_user_id(phone_number)
             now = _utc_now()
+
+            # Backward compatibility: merge old wa:+92... identity into canonical wa:92...
+            _migrate_legacy_user_identity(db, user_id, phone_number)
             
             db.users.update_one(
                 {"user_id": user_id},

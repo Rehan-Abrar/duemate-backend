@@ -42,6 +42,16 @@ def get_access_token() -> str:
     return get_env("META_BEARER_TOKEN", "META_ACCESS_TOKEN", "WHATSAPP_TOKEN")
 
 
+def normalize_dashboard_url(value: str) -> str:
+    """Normalize dashboard URL and provide a safe fallback."""
+    url = str(value or "").strip()
+    if not url:
+        url = "https://duemate-dashboard.vercel.app"
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    return url.rstrip("/")
+
+
 def send_text_message(
     to_number: str,
     message_body: str,
@@ -169,6 +179,8 @@ def send_task_acknowledgment(
     # Format due date if it's a datetime object
     if due_date and hasattr(due_date, 'strftime'):
         due_date = due_date.strftime("%b %d, %Y")
+
+    dashboard_url = normalize_dashboard_url(dashboard_url)
     
     if is_duplicate:
         message = (
