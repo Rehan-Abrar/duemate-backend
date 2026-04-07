@@ -1,10 +1,12 @@
 import os
+import re
 from datetime import datetime, timedelta, timezone
 import hmac
 import hashlib
 import json
 import logging
 import secrets
+import unicodedata
 import uuid
 from typing import Optional
 from functools import wraps
@@ -101,34 +103,38 @@ GREETINGS = {
 }
 
 
+def _normalize_intent_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    cleaned = unicodedata.normalize("NFKC", text).casefold()
+    cleaned = re.sub(r"[\u200b-\u200f\ufeff]", "", cleaned)
+    cleaned = re.sub(r"[^\w\s]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
 def _is_greeting(text: str) -> bool:
     """
     Check if a message is a greeting/casual message that shouldn't be parsed as a task.
     Returns True if this is just a greeting.
     """
-    if not text:
+    if not isinstance(text, str):
         return False
-    
-    cleaned = text.lower().strip()
-    
-    # Debug logging
-    import logging
+
+    cleaned = _normalize_intent_text(text)
+    if not cleaned:
+        return False
+
     logger = logging.getLogger(__name__)
-    logger.info(f"_is_greeting check: original={repr(text)} cleaned={repr(cleaned)}")
-    
-    # Exact match
+    logger.info("_is_greeting check: original=%r cleaned=%r", text, cleaned)
+
     if cleaned in GREETINGS:
-        logger.info(f"_is_greeting: EXACT MATCH - {repr(cleaned)}")
         return True
-    
-    # Single word or very short phrase (3 words or less) containing greetings
+
     words = cleaned.split()
-    logger.info(f"_is_greeting: words={words} len={len(words)}")
     if len(words) <= 3 and any(w in GREETINGS for w in words):
-        logger.info(f"_is_greeting: WORD MATCH - found greeting in {words}")
         return True
-    
-    logger.info(f"_is_greeting: NO MATCH - {repr(cleaned)}")
+
     return False
 
 
@@ -593,6 +599,11 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                 elif message_type in message and isinstance(message.get(message_type), dict):
                     text_body = json.dumps(message.get(message_type), ensure_ascii=True)
 
+                if message_type != "text":
+                    app.logger.info("non_text_message_skipped type=%s from=%s", message_type, sender)
+                    summary["inbound_messages"] += 1
+                    continue
+
                 source_key, is_forwarded, forwarded_from = _derive_source_key(message)
 
                 message_doc = {
@@ -654,8 +665,9 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     )
 
                 # Check if this is just a greeting — don't parse as task
-                app.logger.info("checking_greeting text=%s is_greeting=%s", repr(text_body), _is_greeting(text_body))
-                if _is_greeting(text_body):
+                is_greeting = _is_greeting(text_body)
+                app.logger.info("checking_greeting text=%r is_greeting=%s", text_body, is_greeting)
+                if is_greeting:
                     app.logger.info("greeting_detected from=%s message=%s", sender, text_body[:50])
                     summary["inbound_messages"] += 1
                     
@@ -663,7 +675,7 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     try:
                         send_text_message(
                             to_number=sender,
-                            message_body="Hey! 👋 Send me your assignment or quiz details and I'll save them for you.",
+                            message_body="Hey! Send me your assignment or quiz details and I will save them for you.",
                             preview_url=False
                         )
                     except Exception as e:
