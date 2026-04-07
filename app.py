@@ -7,20 +7,37 @@ import logging
 import secrets
 import uuid
 from typing import Optional
+from functools import wraps
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from bson import ObjectId
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 import requests
 from werkzeug.security import check_password_hash, generate_password_hash
+import jwt
 
 from utils.parse_task import SEMESTER_COURSES, parse_task
+from utils.fingerprint import make_fingerprint, check_duplicate
+from utils.auth import (
+    create_otp,
+    verify_otp,
+    create_access_token,
+    create_refresh_token,
+    verify_access_token,
+    verify_refresh_token,
+    jwt_required,
+)
+from utils.whatsapp_sender import send_otp_message, send_task_acknowledgment, send_text_message
+from utils.rate_limiter import rate_limit_ip, rate_limit_phone, check_webhook_rate_limit
+from utils.errors import make_error_response, register_error_handlers
+from utils.scheduler import start_scheduler
 
 
 _mongo_client: Optional[MongoClient] = None
 _indexes_ready = False
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 
 
 def _utc_now() -> datetime:
@@ -69,6 +86,50 @@ def _parse_due_date_value(value: str) -> Optional[datetime]:
 
 def _build_user_id(phone_number: str) -> str:
     return f"wa:{phone_number}"
+
+
+def _build_admin_id() -> str:
+    return "admin:system"
+
+
+# Greeting detection constants and function
+GREETINGS = {
+    "hi", "hello", "hey", "hii", "helo", "hiya",
+    "salam", "assalam", "assalamualaikum", "walaikum",
+    "sup", "yo", "good morning", "good evening", "gm", "ge",
+    "start", "help", "test"
+}
+
+
+def _is_greeting(text: str) -> bool:
+    """
+    Check if a message is a greeting/casual message that shouldn't be parsed as a task.
+    Returns True if this is just a greeting.
+    """
+    if not text:
+        return False
+    
+    cleaned = text.lower().strip()
+    
+    # Debug logging
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"_is_greeting check: original={repr(text)} cleaned={repr(cleaned)}")
+    
+    # Exact match
+    if cleaned in GREETINGS:
+        logger.info(f"_is_greeting: EXACT MATCH - {repr(cleaned)}")
+        return True
+    
+    # Single word or very short phrase (3 words or less) containing greetings
+    words = cleaned.split()
+    logger.info(f"_is_greeting: words={words} len={len(words)}")
+    if len(words) <= 3 and any(w in GREETINGS for w in words):
+        logger.info(f"_is_greeting: WORD MATCH - found greeting in {words}")
+        return True
+    
+    logger.info(f"_is_greeting: NO MATCH - {repr(cleaned)}")
+    return False
 
 
 def _normalize_phone_number(value: str) -> str:
@@ -205,12 +266,72 @@ def _serialize_user_profile(user: dict) -> dict:
     }
 
 
-def _get_admin_key() -> str:
-    return get_env("ADMIN_API_KEY", "ADMIN_KEY", default="")
+def _get_admin_username() -> str:
+    return get_env("ADMIN_USERNAME", default="admin")
+
+
+def _is_admin_user(user: dict) -> bool:
+    return user and str(user.get("user_id", "")) == _build_admin_id()
+
+
+def _ensure_admin_user_exists(db):
+    """Create or update admin user in DB if needed."""
+    admin_id = _build_admin_id()
+    admin_username = _get_admin_username()
+    admin_password = get_env(
+        "ADMIN_PASSWORD",
+        default="admin123"
+    )
+    
+    admin_user = db.users.find_one({"user_id": admin_id})
+    if not admin_user:
+        now = _utc_now()
+        db.users.insert_one({
+            "user_id": admin_id,
+            "username": admin_username,
+            "password_hash": generate_password_hash(admin_password),
+            "password_set": True,
+            "created_at": now,
+            "last_seen": now,
+            "settings": {
+                "timezone": "UTC",
+                "is_admin": True,
+            },
+        })
+    return admin_id
+
+
+def admin_auth_required(f):
+    """Decorator to require admin authentication via JWT token."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get("Authorization", "").replace("Bearer ", "")
+        if not token:
+            return jsonify({"error": "missing_token"}), 401
+        
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            user_id = payload.get("user_id")
+            db = get_mongo_db()
+            if db is None:
+                return jsonify({"error": "database_not_configured"}), 503
+            
+            user = db.users.find_one({"user_id": user_id})
+            
+            if not user or not _is_admin_user(user):
+                return jsonify({"error": "forbidden"}), 403
+            
+            g.user = user
+            return f(*args, **kwargs)
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "invalid_token"}), 401
+    
+    return decorated
 
 
 def _verify_admin_key() -> tuple[bool, Optional[tuple]]:
-    admin_key = _get_admin_key()
+    """Fallback admin key verification for backwards compatibility."""
+    admin_key = get_env("ADMIN_API_KEY", "ADMIN_KEY", default="")
     if not admin_key:
         return False, (jsonify({"error": "admin_key_not_configured"}), 503)
 
@@ -311,10 +432,24 @@ def ensure_mongo_indexes() -> None:
     db.tasks.create_index("created_at")
     db.tasks.create_index("source_message_id", unique=True)
     db.tasks.create_index("source_key")
+    db.tasks.create_index("fingerprint")  # For duplicate detection
     db.course_source_mappings.create_index([("user_id", 1), ("source_key", 1)], unique=True)
     db.course_source_mappings.create_index("course_code")
     db.reminders_sent.create_index("user_id")
     db.reminders_sent.create_index("task_id")
+    db.reminders_sent.create_index([("task_id", 1), ("user_id", 1)])  # Compound for lookups
+    # OTP sessions with TTL (expires_at is set, MongoDB auto-deletes after expiry)
+    db.otp_sessions.create_index("phone_number")
+    db.otp_sessions.create_index("expires_at", expireAfterSeconds=0)
+    # Refresh tokens with TTL
+    db.refresh_tokens.create_index("user_id")
+    db.refresh_tokens.create_index("token_hash", unique=True)
+    db.refresh_tokens.create_index("expires_at", expireAfterSeconds=0)
+    # Archived collections
+    db.archived_tasks.create_index("user_id")
+    db.archived_tasks.create_index("created_at")
+    db.archived_reminders_sent.create_index("user_id")
+    db.archived_reminders_sent.create_index("sent_at")
     _indexes_ready = True
 
 
@@ -518,16 +653,49 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                         upsert=True,
                     )
 
+                # Check if this is just a greeting — don't parse as task
+                app.logger.info("checking_greeting text=%s is_greeting=%s", repr(text_body), _is_greeting(text_body))
+                if _is_greeting(text_body):
+                    app.logger.info("greeting_detected from=%s message=%s", sender, text_body[:50])
+                    summary["inbound_messages"] += 1
+                    
+                    # Send friendly greeting response
+                    try:
+                        send_text_message(
+                            to_number=sender,
+                            message_body="Hey! 👋 Send me your assignment or quiz details and I'll save them for you.",
+                            preview_url=False
+                        )
+                    except Exception as e:
+                        app.logger.warning("greeting_reply_failed from=%s error=%s", sender, str(e))
+                    
+                    # Don't create a task, but still return 200 to Meta
+                    continue
+                
+                app.logger.info("not_greeting_proceeding_to_parse text=%s", repr(text_body))
+
                 mapped_course = _resolve_course_from_mapping(db, user_id, source_key) if user_id else None
                 parse_result = parse_task(text_body, course_hint=mapped_course)
                 task_status = "needs_review" if parse_result["needs_review"] else "pending"
                 course_unresolved = _is_course_unresolved(parse_result.get("course"), source_key)
                 course_resolution_method = "mapped" if mapped_course else ("heuristic" if parse_result.get("course") else "unresolved")
+                
+                # Generate fingerprint for duplicate detection
+                fingerprint = make_fingerprint(
+                    user_id=user_id,
+                    course=parse_result.get("course"),
+                    title=parse_result.get("title"),
+                    due_date=parse_result.get("due_date")
+                )
+                is_potential_duplicate = check_duplicate(db, user_id, fingerprint)
+                
                 task_doc = {
                     "user_id": user_id,
                     "phone_number": sender,
                     "task_type": parse_result["task_type"],
                     "raw_message": text_body,
+                    "fingerprint": fingerprint,
+                    "is_potential_duplicate": is_potential_duplicate,
                     "parsed_course": parse_result["course"],
                     "parsed_title": parse_result["title"],
                     "parsed_due_date": parse_result["due_date"],
@@ -535,6 +703,8 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     "quiz_duration": parse_result["quiz_duration"],
                     "quiz_time": parse_result["quiz_time"],
                     "parse_confidence": parse_result["confidence"],
+                    "parse_method": parse_result.get("parse_method", "unknown"),
+                    "groq_raw_response": parse_result.get("groq_raw_response"),
                     "needs_review": parse_result["needs_review"] or course_unresolved,
                     "status": task_status,
                     "course_unresolved": course_unresolved,
@@ -562,18 +732,21 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
 
                 summary["inbound_messages"] += 1
 
+                # Send acknowledgment via WhatsApp using enhanced messages
                 dashboard_url = get_env("DASHBOARD_URL", default="")
-                ack_template = get_env("ACK_MESSAGE_TEMPLATE", default="DueMate: Task saved.")
-                review_template = get_env(
-                    "ACK_REVIEW_TEMPLATE",
-                    default="DueMate: Please review parsed details on dashboard.",
-                )
-                if dashboard_url:
-                    review_template = f"{review_template} {dashboard_url}"
-
-                ack_message = review_template if parse_result["needs_review"] else ack_template
-                send_result = send_whatsapp_text_message(sender, ack_message) if sender else {"sent": False}
-                if send_result.get("sent"):
+                
+                send_result = send_task_acknowledgment(
+                    to_phone=sender,
+                    task_type=parse_result["task_type"],
+                    course=parse_result.get("course"),
+                    due_date=parse_result.get("due_date"),
+                    confidence=parse_result.get("confidence", 0.0),
+                    is_duplicate=is_potential_duplicate,
+                    needs_review=parse_result.get("needs_review", False),
+                    dashboard_url=dashboard_url
+                ) if sender else {"success": False}
+                
+                if send_result.get("success"):
                     summary["acked"] += 1
                 else:
                     summary["ack_failures"] += 1
@@ -643,10 +816,34 @@ def create_app() -> Flask:
         )
 
     def resolve_authenticated_user_or_401(db):
+        # Backwards-compatible auth resolution: session token first, then JWT.
         user, session = _resolve_authenticated_user(db)
-        if user is None or session is None:
-            return None, None, (jsonify({"error": "unauthorized"}), 401)
-        return user, session, None
+        if user is not None:
+            return user, session, None
+
+        auth_header = request.headers.get("Authorization", "").strip()
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+            payload = verify_access_token(token)
+            if payload:
+                user_id = str(payload.get("sub") or payload.get("user_id") or "")
+                if user_id:
+                    user = db.users.find_one({"user_id": user_id})
+                    if user:
+                        expires_at = None
+                        exp_value = payload.get("exp")
+                        if isinstance(exp_value, (int, float)):
+                            expires_at = datetime.fromtimestamp(exp_value, tz=timezone.utc)
+                        elif isinstance(exp_value, datetime):
+                            expires_at = exp_value if exp_value.tzinfo else exp_value.replace(tzinfo=timezone.utc)
+                        jwt_session = {
+                            "expires_at": expires_at,
+                            "last_seen": _utc_now(),
+                            "auth_type": "jwt",
+                        }
+                        return user, jwt_session, None
+
+        return None, None, (jsonify({"error": "unauthorized"}), 401)
 
     @app.post("/api/auth/signup")
     def auth_signup():
@@ -732,6 +929,61 @@ def create_app() -> Flask:
             }
         )
 
+    @app.post("/api/admin/login")
+    def admin_login():
+        """Admin login endpoint using username and password."""
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        ensure_mongo_indexes()
+        _ensure_admin_user_exists(db)
+
+        data = request.get_json(silent=True) or {}
+        username = str(data.get("username", "")).strip()
+        password = str(data.get("password", "")).strip()
+
+        if not username or not password:
+            return jsonify({"error": "credentials_required"}), 400
+
+        admin_username = _get_admin_username()
+        if username != admin_username:
+            return jsonify({"error": "invalid_credentials"}), 401
+
+        admin_id = _build_admin_id()
+        user = db.users.find_one({"user_id": admin_id})
+        password_hash = str((user or {}).get("password_hash") or "")
+
+        if not user or not password_hash or not check_password_hash(password_hash, password):
+            return jsonify({"error": "invalid_credentials"}), 401
+
+        now = _utc_now()
+        expires_at = now + timedelta(hours=24)
+        jwt_token = jwt.encode(
+            {
+                "user_id": admin_id,
+                "exp": expires_at,
+                "iat": now,
+                "type": "admin",
+            },
+            JWT_SECRET,
+            algorithm="HS256",
+        )
+
+        return jsonify(
+            {
+                "token": jwt_token,
+                "token_type": "Bearer",
+                "expires_in": 86400,
+                "expires_at": _serialize_for_json(expires_at),
+                "user": {
+                    "user_id": admin_id,
+                    "username": admin_username,
+                    "is_admin": True,
+                },
+            }
+        ), 200
+
     @app.post("/api/auth/logout")
     def auth_logout():
         db = get_mongo_db()
@@ -768,12 +1020,212 @@ def create_app() -> Flask:
             }
         )
 
-    @app.get("/api/messages/recent")
-    def recent_messages():
-        ok, error_response = _verify_admin_key()
-        if not ok:
-            return error_response
+    # ─────────────────────────────────────────────────────────────────────────
+    # OTP-BASED AUTHENTICATION (WhatsApp)
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    @app.post("/api/auth/start")
+    @rate_limit_phone(limit=5, window_minutes=10, phone_param="phone_number")
+    def auth_otp_start():
+        """
+        Request OTP to be sent via WhatsApp.
+        
+        The user must have messaged the bot first to open the 24h service window.
+        """
+        db = get_mongo_db()
+        if db is None:
+            return make_error_response("database_not_configured", status_code=503)
+        
+        data = request.get_json(silent=True) or {}
+        phone_number = str(data.get("phone_number", "")).strip()
+        
+        if not phone_number:
+            return make_error_response("phone_number_required", status_code=400)
+        
+        # Normalize phone number
+        if not phone_number.startswith("+"):
+            if phone_number.startswith("0"):
+                phone_number = "+92" + phone_number[1:]
+            else:
+                phone_number = "+92" + phone_number
+        
+        try:
+            # Create OTP and store in database
+            otp_code, expires_at = create_otp(db, phone_number)
+            
+            # Send OTP via WhatsApp
+            send_result = send_otp_message(phone_number, otp_code)
+            
+            if not send_result.get("success"):
+                app.logger.error(
+                    "otp_send_failed phone=%s error=%s",
+                    phone_number[:4] + "***",
+                    send_result.get("error", "unknown")
+                )
+                return make_error_response(
+                    "otp_send_failed",
+                    message="We couldn't send the OTP. Make sure you've messaged the bot first.",
+                    status_code=500
+                )
+            
+            return jsonify({
+                "message": "OTP sent to your WhatsApp",
+                "phone_number": phone_number[:4] + "***" + phone_number[-2:],
+                "expires_in_seconds": 600,
+            }), 200
+            
+        except Exception as e:
+            app.logger.exception("auth_start_failed error=%s", str(e))
+            return make_error_response("internal_error", status_code=500)
+    
+    @app.post("/api/auth/verify")
+    @rate_limit_phone(limit=10, window_minutes=10, phone_param="phone_number")
+    def auth_otp_verify():
+        """
+        Verify OTP and issue JWT access token + refresh token.
+        """
+        db = get_mongo_db()
+        if db is None:
+            return make_error_response("database_not_configured", status_code=503)
+        
+        data = request.get_json(silent=True) or {}
+        phone_number = str(data.get("phone_number", "")).strip()
+        otp_code = str(data.get("otp", "")).strip()
+        
+        if not phone_number or not otp_code:
+            return make_error_response(
+                "missing_required_field",
+                message="Phone number and OTP are required.",
+                status_code=400
+            )
+        
+        # Normalize phone number
+        if not phone_number.startswith("+"):
+            if phone_number.startswith("0"):
+                phone_number = "+92" + phone_number[1:]
+            else:
+                phone_number = "+92" + phone_number
+        
+        try:
+            # Verify OTP
+            is_valid, error_code = verify_otp(db, phone_number, otp_code)
+            
+            if not is_valid:
+                return make_error_response(error_code, status_code=401)
+            
+            # Get or create user
+            user_id = _build_user_id(phone_number)
+            now = _utc_now()
+            
+            db.users.update_one(
+                {"user_id": user_id},
+                {
+                    "$set": {
+                        "user_id": user_id,
+                        "phone_number": phone_number,
+                        "last_seen": now,
+                        "updated_at": now,
+                    },
+                    "$setOnInsert": {
+                        "created_at": now,
+                        "settings": {
+                            "timezone": "UTC",
+                            "reminder_hours_before": 24,
+                            "reminder_enabled": True,
+                        },
+                    },
+                },
+                upsert=True,
+            )
+            
+            user = db.users.find_one({"user_id": user_id})
+            
+            # Create JWT tokens
+            access_token = create_access_token(user_id)
+            refresh_token, _ = create_refresh_token(db, user_id)
+            
+            return jsonify({
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "Bearer",
+                "expires_in": 900,  # 15 minutes
+                "user": _serialize_user_profile(user or {}),
+            }), 200
+            
+        except Exception as e:
+            app.logger.exception("auth_verify_failed error=%s", str(e))
+            return make_error_response("internal_error", status_code=500)
+    
+    @app.post("/api/auth/refresh")
+    def auth_token_refresh():
+        """
+        Refresh access token using refresh token.
+        """
+        db = get_mongo_db()
+        if db is None:
+            return make_error_response("database_not_configured", status_code=503)
+        
+        data = request.get_json(silent=True) or {}
+        refresh_token = str(data.get("refresh_token", "")).strip()
+        
+        if not refresh_token:
+            return make_error_response(
+                "missing_required_field",
+                message="Refresh token is required.",
+                status_code=400
+            )
+        
+        try:
+            # Verify refresh token
+            user_id = verify_refresh_token(db, refresh_token)
+            
+            if not user_id:
+                return make_error_response("token_invalid", status_code=401)
+            
+            # Create new access token
+            access_token = create_access_token(user_id)
+            
+            return jsonify({
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": 900,
+            }), 200
+            
+        except Exception as e:
+            app.logger.exception("auth_refresh_failed error=%s", str(e))
+            return make_error_response("internal_error", status_code=500)
+    
+    @app.get("/api/user/verify")
+    def user_verify():
+        """
+        Verify JWT token and return user info.
+        Used to check if session is still valid.
+        """
+        db = get_mongo_db()
+        if db is None:
+            return make_error_response("database_not_configured", status_code=503)
+        
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return make_error_response("unauthorized", status_code=401)
+        
+        token = auth_header[7:].strip()
+        payload = verify_access_token(token)
+        
+        if not payload:
+            return make_error_response("token_invalid", status_code=401)
+        
+        user_id = payload.get("sub")
+        user = db.users.find_one({"user_id": user_id})
+        
+        if not user:
+            return make_error_response("unauthorized", status_code=401)
+        
+        return jsonify(_serialize_user_profile(user)), 200
 
+    @app.get("/api/messages/recent")
+    @admin_auth_required
+    def recent_messages():
         db = get_mongo_db()
         if db is None:
             return jsonify({"error": "database_not_configured"}), 503
@@ -793,11 +1245,8 @@ def create_app() -> Flask:
             return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
 
     @app.get("/api/delivery-status")
+    @admin_auth_required
     def delivery_status():
-        ok, error_response = _verify_admin_key()
-        if not ok:
-            return error_response
-
         db = get_mongo_db()
         if db is None:
             return jsonify({"error": "database_not_configured"}), 503
@@ -878,11 +1327,8 @@ def create_app() -> Flask:
             return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
 
     @app.get("/api/tasks")
+    @admin_auth_required
     def list_tasks():
-        ok, error_response = _verify_admin_key()
-        if not ok:
-            return error_response
-
         db = get_mongo_db()
         if db is None:
             return jsonify({"error": "database_not_configured"}), 503
@@ -1034,6 +1480,26 @@ def create_app() -> Flask:
 
         updated = db.tasks.find_one({"_id": oid, "user_id": user.get("user_id", "")})
         return jsonify({"item": _serialize_for_json(updated)})
+
+    @app.delete("/api/student/tasks/<task_id>")
+    def delete_student_task(task_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        oid = _parse_object_id(task_id)
+        if oid is None:
+            return jsonify({"error": "invalid_task_id"}), 400
+
+        result = db.tasks.delete_one({"_id": oid, "user_id": user.get("user_id", "")})
+        if result.deleted_count == 0:
+            return jsonify({"error": "task_not_found"}), 404
+
+        return ("", 204)
 
     @app.post("/api/student/tasks/<task_id>/confirm")
     def confirm_student_task(task_id: str):
@@ -1520,6 +1986,18 @@ def create_app() -> Flask:
 
 app = create_app()
 
+# Register global error handlers
+register_error_handlers(app)
+
 if __name__ == "__main__":
+    # Ensure admin user exists on startup
+    db = get_mongo_db()
+    if db is not None:
+        ensure_mongo_indexes()
+        _ensure_admin_user_exists(db)
+    
+    # Initialize background scheduler for reminders and archival
+    start_scheduler(get_mongo_db)
+    
     debug_mode = os.getenv("FLASK_DEBUG", "false").lower() in {"1", "true", "yes", "on"}
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=debug_mode)
