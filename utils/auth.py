@@ -10,7 +10,7 @@ Provides:
 Security notes:
 - OTPs are bcrypt-hashed before storage (10-minute TTL)
 - Access tokens are short-lived (15 minutes)
-- Refresh tokens are long-lived (7 days), stored hashed
+- Refresh tokens are long-lived (30 days by default), stored hashed
 - All tokens use constant-time comparison
 """
 
@@ -28,10 +28,20 @@ from flask import g, jsonify, request, Response
 
 logger = logging.getLogger(__name__)
 
+
+def _get_refresh_token_expiry_days() -> int:
+    """Get refresh token TTL in days from env with safe bounds."""
+    raw = os.getenv("REFRESH_TOKEN_EXPIRY_DAYS", os.getenv("SESSION_TTL_DAYS", "30")).strip()
+    try:
+        days = int(raw)
+    except ValueError:
+        days = 30
+    return max(1, min(days, 90))
+
 # JWT configuration
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRY_MINUTES = 15
-REFRESH_TOKEN_EXPIRY_DAYS = 7
+REFRESH_TOKEN_EXPIRY_DAYS = _get_refresh_token_expiry_days()
 
 
 def get_jwt_secret() -> str:
