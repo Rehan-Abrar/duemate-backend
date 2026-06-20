@@ -154,6 +154,26 @@ def _normalize_phone_number(value: str) -> str:
     return digits
 
 
+def _has_recent_inbound_message(db, phone_number: str, window_hours: int = 24) -> bool:
+    """Check whether the phone has an inbound WhatsApp message in the service window."""
+    if db is None:
+        return False
+
+    normalized_phone = _normalize_phone_number(phone_number)
+    if not normalized_phone:
+        return False
+
+    threshold = _utc_now() - timedelta(hours=window_hours)
+    recent = db.messages.find_one(
+        {
+            "from": normalized_phone,
+            "received_at": {"$gte": threshold},
+        },
+        {"_id": 1},
+    )
+    return recent is not None
+
+
 def _parse_bool_arg(name: str) -> Optional[bool]:
     raw_value = request.args.get(name, "").strip().lower()
     if raw_value in {"true", "false"}:
@@ -781,6 +801,7 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     "needs_review": parse_result["needs_review"] or course_unresolved,
                     "status": task_status,
                     "course_unresolved": course_unresolved,
+                    "date_uncertain": parse_result.get("date_uncertain", False),
                     "course_resolution_method": course_resolution_method,
                     "source_key": source_key,
                     "is_forwarded": is_forwarded,
@@ -1116,6 +1137,13 @@ def create_app() -> Flask:
         
         if not phone_number:
             return make_error_response("phone_number_required", status_code=400)
+
+        if not _has_recent_inbound_message(db, phone_number, window_hours=24):
+            return make_error_response(
+                "whatsapp_window_closed",
+                message="Please send 'hello' to the bot on WhatsApp, then request OTP again.",
+                status_code=400,
+            )
         
         try:
             # Create OTP and store in database
@@ -1532,6 +1560,9 @@ def create_app() -> Flask:
         update_doc["updated_at"] = _utc_now()
         if "needs_review" not in update_doc:
             update_doc["needs_review"] = False
+        if not update_doc["needs_review"]:
+            update_doc["date_uncertain"] = False
+            update_doc["course_unresolved"] = False
         if "status" not in update_doc and not update_doc["needs_review"]:
             update_doc["status"] = "pending"
 
@@ -1586,6 +1617,7 @@ def create_app() -> Flask:
                     "needs_review": False,
                     "status": "pending",
                     "course_unresolved": False,
+                    "date_uncertain": False,
                     "course_resolution_method": "manual",
                     "corrected_at": _utc_now(),
                     "updated_at": _utc_now(),
@@ -1818,6 +1850,9 @@ def create_app() -> Flask:
 
         if "needs_review" not in update_doc:
             update_doc["needs_review"] = False
+        if not update_doc["needs_review"]:
+            update_doc["date_uncertain"] = False
+            update_doc["course_unresolved"] = False
         if "status" not in update_doc and not update_doc["needs_review"]:
             update_doc["status"] = "pending"
 
@@ -1845,6 +1880,7 @@ def create_app() -> Flask:
                     "needs_review": False,
                     "status": "pending",
                     "course_unresolved": False,
+                    "date_uncertain": False,
                     "course_resolution_method": "manual",
                     "corrected_at": _utc_now(),
                     "updated_at": _utc_now(),

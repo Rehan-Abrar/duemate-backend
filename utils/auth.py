@@ -63,6 +63,16 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_utc_aware(value: Optional[datetime]) -> Optional[datetime]:
+    """Normalize datetimes from MongoDB to timezone-aware UTC."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        # PyMongo typically returns naive UTC datetimes unless tz_aware is enabled.
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 # ============================================================================
 # OTP Functions
 # ============================================================================
@@ -312,8 +322,9 @@ def verify_refresh_token(db, token: str) -> Optional[str]:
     
     if record.get("revoked"):
         return None
-    
-    if record.get("expires_at", now) <= now:
+
+    expires_at = _as_utc_aware(record.get("expires_at"))
+    if expires_at is None or expires_at <= now:
         return None
     
     return record.get("user_id")
