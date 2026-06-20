@@ -798,7 +798,7 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     "parse_confidence": parse_result["confidence"],
                     "parse_method": parse_result.get("parse_method", "unknown"),
                     "groq_raw_response": parse_result.get("groq_raw_response"),
-                    "needs_review": parse_result["needs_review"] or course_unresolved,
+                    "needs_review": parse_result["needs_review"],
                     "status": task_status,
                     "course_unresolved": course_unresolved,
                     "date_uncertain": parse_result.get("date_uncertain", False),

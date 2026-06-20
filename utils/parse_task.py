@@ -758,7 +758,10 @@ def _merge_parse_results(
     notes = "; ".join(dict.fromkeys(notes_parts)) if notes_parts else None
 
     date_uncertain = due_date is None or "date_uncertain" in date_notes or "groq_date_rejected" in date_notes
-    needs_review = date_uncertain or _is_generic_title(title) or confidence < 0.7
+    # Only flag for WhatsApp review when date info is missing/uncertain.
+    # Missing course is handled separately via course_unresolved flag.
+    # A generic/missing title is imperfect but not review-critical.
+    needs_review = date_uncertain or (due_date is None and confidence < 0.5)
 
     return {
         "task_type": task_type,

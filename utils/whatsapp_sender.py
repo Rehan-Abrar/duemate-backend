@@ -162,7 +162,7 @@ def send_task_acknowledgment(
 ) -> dict:
     """
     Send task parsing acknowledgment message.
-    
+
     Args:
         to_phone: Recipient phone number
         task_type: "assignment" or "quiz"
@@ -170,41 +170,49 @@ def send_task_acknowledgment(
         due_date: Formatted due date string or datetime (or None)
         confidence: Parse confidence 0.0-1.0
         is_duplicate: Whether this appears to be a duplicate
-        needs_review: Whether the task needs manual review
+        needs_review: Whether date is genuinely uncertain/missing
         dashboard_url: URL to the dashboard
-        
+
     Returns:
         Result dict with success status
     """
     # Format due date if it's a datetime object
     if due_date and hasattr(due_date, 'strftime'):
-        due_date = due_date.strftime("%b %d, %Y")
+        due_date = due_date.strftime("%b %d, %Y at %I:%M %p")
 
     dashboard_url = normalize_dashboard_url(dashboard_url)
-    
+
     if is_duplicate:
         message = (
             f"🔁 This looks like something you already sent.\n\n"
             f"Check your dashboard to confirm:\n{dashboard_url}"
         )
-    elif confidence >= 0.8 and not needs_review:
+    elif needs_review or not due_date:
+        # Date is uncertain or missing — this is the real review case
         course_part = f" for *{course}*" if course else ""
-        due_part = f" due *{due_date}*" if due_date else ""
         message = (
-            f"✅ Got it! {task_type.title()}{course_part}{due_part}.\n\n"
+            f"⚠️ Saved{course_part} but I couldn't determine the due date.\n\n"
+            f"Please set it here:\n{dashboard_url}"
+        )
+    elif course and due_date:
+        # Both course and date detected — clean confirmation
+        message = (
+            f"✅ Got it! *{task_type.title()}* for *{course}*\n"
+            f"📅 Due: *{due_date}*\n\n"
             f"Track it here:\n{dashboard_url}"
         )
-    elif confidence > 0:
+    elif due_date:
+        # Date known, course missing — save succeeded but note missing course
         message = (
-            f"⚠️ Saved but I'm not sure I got all the details right.\n\n"
-            f"Please review here:\n{dashboard_url}"
+            f"✅ Saved! *{task_type.title()}* due *{due_date}*\n"
+            f"❓ Course not set — tap to assign it:\n{dashboard_url}"
         )
     else:
         message = (
             f"❌ I received your message but couldn't extract the details.\n\n"
             f"Open your dashboard to fill them in:\n{dashboard_url}"
         )
-    
+
     result = send_text_message(to_phone, message)
     return {"success": result.get("sent", False), **result}
 
