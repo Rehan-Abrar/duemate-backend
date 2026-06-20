@@ -178,6 +178,12 @@ def send_task_acknowledgment(
     """
     # Format due date if it's a datetime object
     if due_date and hasattr(due_date, 'strftime'):
+        from datetime import timezone, timedelta
+        pkt = timezone(timedelta(hours=5))
+        if due_date.tzinfo is None:
+            due_date = due_date.replace(tzinfo=timezone.utc).astimezone(pkt)
+        else:
+            due_date = due_date.astimezone(pkt)
         due_date = due_date.strftime("%b %d, %Y at %I:%M %p")
 
     dashboard_url = normalize_dashboard_url(dashboard_url)

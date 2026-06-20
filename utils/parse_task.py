@@ -70,6 +70,7 @@ COURSE_ALIASES = {
     "ai driven software development": "AI-Driven Software Development",
     "ai driven": "AI-Driven Software Development",
     "ai software": "AI-Driven Software Development",
+    "ai": "AI-Driven Software Development",
     "aisd": "AI-Driven Software Development",
     "parallel & distributed computing": "Parallel & Distributed Computing",
     "parallel and distributed computing": "Parallel & Distributed Computing",
@@ -100,7 +101,7 @@ TASK_TYPE_KEYWORDS = {
 }
 
 QUIZ_MATERIAL_PATTERN = re.compile(
-    r"\b(?:chapter|chapters|ch|slides?|section|unit)\s*\d+(?:\s*[-to]{1,3}\s*\d+)?\b",
+    r"\b(?:chapter|chapters|ch|slides?|section|unit)\s*\d+(?:\s*(?:[-to]{1,3}|and|or|aur|&|,)\s*\d+)*\b",
     re.IGNORECASE,
 )
 QUIZ_DURATION_PATTERN = re.compile(r"\b\d+\s*(?:hours?|hrs?|minutes?|mins?)\b", re.IGNORECASE)
@@ -218,7 +219,9 @@ def _ensure_utc(dt: datetime) -> datetime:
 
 
 def _dateparser_settings(now: datetime) -> dict:
-    return {**DATEPARSER_SETTINGS, "RELATIVE_BASE": now}
+    pkt = timezone(timedelta(hours=5))
+    now_pkt = now.astimezone(pkt)
+    return {**DATEPARSER_SETTINGS, "RELATIVE_BASE": now_pkt}
 
 
 def _is_valid_course_code_match(match: re.Match) -> bool:
@@ -531,6 +534,8 @@ def detect_course(text: str) -> Optional[str]:
     lower = text.lower()
     for alias, canonical in COURSE_ALIASES.items():
         if re.search(rf"\b{re.escape(alias)}\b", lower):
+            if alias == "networks" and "neural networks" in lower:
+                continue
             return canonical
 
     for match in COURSE_CODE_PATTERN.finditer(text):
@@ -549,19 +554,28 @@ def detect_due_date(text: str, now: datetime) -> Optional[datetime]:
     lower = text.lower()
     best: Optional[datetime] = None
 
+    # Base our relative day calculations on the current PKT day, not UTC
+    pkt = timezone(timedelta(hours=5))
+    now_pkt = now.astimezone(pkt)
+
     # --- Step 1: detect the DAY (midnight placeholder) ---
     if "day after tomorrow" in lower:
-        best = (now + timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+        best_pkt = (now_pkt + timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
     elif any(token in lower for token in ["tomorrow", "tmr", "kal", "tommorow", "tommorrow"]):
-        best = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        best_pkt = (now_pkt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     elif "today" in lower:
-        best = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        best_pkt = now_pkt.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        best_pkt = None
 
-    if best is None:
+    if best_pkt is None:
         for day_name, day_idx in WEEKDAY_TO_INDEX.items():
             if re.search(rf"\b{day_name}\b", lower):
-                best = _next_weekday(now, day_idx)
+                best_pkt = _next_weekday(now_pkt, day_idx)
                 break
+                
+    if best_pkt is not None:
+        best = best_pkt.astimezone(timezone.utc)
 
     if best is None:
         settings = _dateparser_settings(now)
@@ -853,7 +867,9 @@ def _parse_with_groq(
     if not groq_api_key:
         raise RuntimeError("GROQ_API_KEY not configured")
 
-    today = now.strftime("%Y-%m-%d")
+    pkt = timezone(timedelta(hours=5))
+    now_pkt = now.astimezone(pkt)
+    today = now_pkt.strftime("%Y-%m-%d")
     system_prompt = _build_groq_system_prompt(today)
 
     payload = {

@@ -144,8 +144,13 @@ def check_reminders(db) -> dict:
         
         hours_until_due = max(0, int((due_date - now).total_seconds() / 3600))
         
-        # Format due date for display
-        due_date_str = due_date.strftime("%b %d, %I:%M %p")
+        # Format due date for display (in PKT)
+        pkt = timezone(timedelta(hours=5))
+        if due_date.tzinfo is None:
+            due_date_pkt = due_date.replace(tzinfo=timezone.utc).astimezone(pkt)
+        else:
+            due_date_pkt = due_date.astimezone(pkt)
+        due_date_str = due_date_pkt.strftime("%b %d, %I:%M %p")
         
         task_type = task.get("task_type", "assignment")
         title = task.get("parsed_title", "Untitled")
