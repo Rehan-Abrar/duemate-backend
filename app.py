@@ -35,6 +35,13 @@ from utils.whatsapp_sender import send_otp_message, send_task_acknowledgment, se
 from utils.rate_limiter import rate_limit_ip, rate_limit_phone, check_webhook_rate_limit
 from utils.errors import make_error_response, register_error_handlers
 from utils.scheduler import start_scheduler
+from utils.conversation import (
+    get_active_conversation,
+    start_conversation,
+    handle_reply,
+    clear_conversation,
+    ensure_conversation_index,
+)
 
 
 _mongo_client: Optional[MongoClient] = None
@@ -536,6 +543,7 @@ def ensure_mongo_indexes() -> None:
     db.archived_tasks.create_index("created_at")
     db.archived_reminders_sent.create_index("user_id")
     db.archived_reminders_sent.create_index("sent_at")
+    ensure_conversation_index(db)
     _indexes_ready = True
 
 
@@ -767,6 +775,54 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                 
                 app.logger.info("not_greeting_proceeding_to_parse text=%s", repr(text_body))
 
+                # ── Conversational context: handle ongoing dialog first ────────
+                active_conv = get_active_conversation(db, normalized_sender or sender)
+                if active_conv:
+                    conv_result = handle_reply(db, active_conv, text_body)
+                    action = conv_result["action"]
+                    prompt = conv_result.get("prompt")
+
+                    if action == "update_task":
+                        task_oid = _parse_object_id(conv_result["task_id"])
+                        if task_oid and conv_result.get("updates"):
+                            from utils.parse_task import _utc_now as _p_now
+                            updates = dict(conv_result["updates"])
+                            updates["updated_at"] = _utc_now()
+                            updates["corrected_at"] = _utc_now()
+                            db.tasks.update_one({"_id": task_oid}, {"$set": updates})
+                            updated_task = db.tasks.find_one({"_id": task_oid})
+                            # Build confirmation ACK
+                            dashboard_url = _normalize_dashboard_url(
+                                get_env("DASHBOARD_URL", default="https://duemate-dashboard.vercel.app")
+                            )
+                            course = updated_task.get("parsed_course") if updated_task else None
+                            due_date = updated_task.get("parsed_due_date") if updated_task else None
+                            task_type = updated_task.get("task_type", "task") if updated_task else "task"
+                            if due_date and hasattr(due_date, "strftime"):
+                                due_fmt = due_date.strftime("%b %d at %I:%M %p")
+                            elif due_date:
+                                due_fmt = str(due_date)[:16]
+                            else:
+                                due_fmt = None
+                            course_part = f" for *{course}*" if course else ""
+                            due_part = f" — due *{due_fmt}*" if due_fmt else ""
+                            confirm_msg = f"✅ Got it{course_part}{due_part}. All set!\n\n{dashboard_url}"
+                            try:
+                                send_text_message(normalized_sender or sender, confirm_msg)
+                            except Exception as e:
+                                app.logger.warning("conv_confirm_send_failed error=%s", e)
+                        summary["inbound_messages"] += 1
+                        continue
+
+                    if prompt:
+                        try:
+                            send_text_message(normalized_sender or sender, prompt)
+                        except Exception as e:
+                            app.logger.warning("conv_prompt_send_failed error=%s", e)
+                    summary["inbound_messages"] += 1
+                    continue
+                # ─────────────────────────────────────────────────────────────
+
                 mapped_course = _resolve_course_from_mapping(db, user_id, source_key) if user_id else None
                 parse_result = parse_task(text_body, course_hint=mapped_course)
                 task_status = "needs_review" if parse_result["needs_review"] else "pending"
@@ -815,9 +871,11 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
 
                 try:
                     db.tasks.insert_one(task_doc)
+                    inserted_task_id = str(task_doc["_id"])
                     summary["tasks_created"] += 1
                 except DuplicateKeyError:
                     summary["duplicates"] += 1
+                    inserted_task_id = None
 
                 if parse_result["needs_review"]:
                     summary["tasks_needs_review"] += 1
@@ -826,26 +884,63 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
 
                 summary["inbound_messages"] += 1
 
-                # Send acknowledgment via WhatsApp using enhanced messages
+                # Send acknowledgment via WhatsApp
                 dashboard_url = _normalize_dashboard_url(
                     get_env("DASHBOARD_URL", default="https://duemate-dashboard.vercel.app")
                 )
-                
-                send_result = send_task_acknowledgment(
-                    to_phone=normalized_sender or sender,
-                    task_type=parse_result["task_type"],
-                    course=parse_result.get("course"),
-                    due_date=parse_result.get("due_date"),
-                    confidence=parse_result.get("confidence", 0.0),
-                    is_duplicate=is_potential_duplicate,
-                    needs_review=parse_result.get("needs_review", False),
-                    dashboard_url=dashboard_url
-                ) if sender else {"success": False}
-                
-                if send_result.get("success"):
-                    summary["acked"] += 1
+
+                # ── Decide whether to start a conversation ───────────────────
+                date_missing = parse_result.get("needs_review") or not parse_result.get("due_date")
+                start_conv_prompt = None
+                if inserted_task_id and not is_potential_duplicate and sender:
+                    missing = None
+                    if course_unresolved and date_missing:
+                        missing = "both"
+                    elif course_unresolved:
+                        missing = "course"
+                    elif date_missing:
+                        missing = "date"
+
+                    if missing:
+                        try:
+                            start_conv_prompt = start_conversation(
+                                db,
+                                phone=normalized_sender or sender,
+                                user_id=user_id,
+                                task_id=inserted_task_id,
+                                missing=missing,
+                            )
+                        except Exception as e:
+                            app.logger.warning("conv_start_failed error=%s", e)
+                # ─────────────────────────────────────────────────────────────
+
+                if start_conv_prompt:
+                    # First send a brief save confirmation, then the prompt
+                    save_ack = "✅ Task saved!"
+                    if parse_result.get("course") and parse_result.get("due_date"):
+                        save_ack = f"✅ Saved *{parse_result['task_type']}*."
+                    try:
+                        send_text_message(normalized_sender or sender, save_ack)
+                        send_text_message(normalized_sender or sender, start_conv_prompt)
+                    except Exception as e:
+                        app.logger.warning("conv_ack_send_failed error=%s", e)
                 else:
-                    summary["ack_failures"] += 1
+                    send_result = send_task_acknowledgment(
+                        to_phone=normalized_sender or sender,
+                        task_type=parse_result["task_type"],
+                        course=parse_result.get("course"),
+                        due_date=parse_result.get("due_date"),
+                        confidence=parse_result.get("confidence", 0.0),
+                        is_duplicate=is_potential_duplicate,
+                        needs_review=parse_result.get("needs_review", False),
+                        dashboard_url=dashboard_url
+                    ) if sender else {"success": False}
+
+                    if send_result.get("success"):
+                        summary["acked"] += 1
+                    else:
+                        summary["ack_failures"] += 1
+
 
             for status in value.get("statuses", []):
                 event_key = build_event_key("status", status, ["id", "status", "timestamp"])

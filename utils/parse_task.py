@@ -105,6 +105,14 @@ QUIZ_MATERIAL_PATTERN = re.compile(
 )
 QUIZ_DURATION_PATTERN = re.compile(r"\b\d+\s*(?:hours?|hrs?|minutes?|mins?)\b", re.IGNORECASE)
 QUIZ_TIME_PATTERN = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", re.IGNORECASE)
+TIME_RANGE_PATTERN = re.compile(
+    r"\b(\d{1,2})(?::\d{2})?\s*[-\u2013to]+\s*\d{1,2}(?::\d{2})?\s*(am|pm)\b",
+    re.IGNORECASE,
+)
+BEFORE_TIME_PATTERN = re.compile(
+    r"\b(?:before|by|till|until|b4)\s+(\d{1,2})(?::\d{2})?\s*(am|pm)\b",
+    re.IGNORECASE,
+)
 WEEKDAY_TO_INDEX = {
     "monday": 0,
     "mon": 0,
@@ -198,7 +206,7 @@ def _next_weekday(now: datetime, target_idx: int) -> datetime:
     days_ahead = target_idx - now.weekday()
     if days_ahead <= 0:
         days_ahead += 7
-    return now.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+    return (now + timedelta(days=days_ahead)).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def _ensure_utc(dt: datetime) -> datetime:
@@ -239,14 +247,35 @@ def _parse_text_date(text: str, now: datetime) -> Optional[datetime]:
     return _ensure_utc(parsed)
 
 
+def _parse_ampm_hour(hour: int, ampm: str) -> int:
+    """Convert 12-hour + am/pm to 24-hour."""
+    ampm = ampm.lower()
+    if ampm == "pm" and hour != 12:
+        return hour + 12
+    if ampm == "am" and hour == 12:
+        return 0
+    return hour
+
+
 def _apply_explicit_time(text: str, dt: datetime, now: datetime) -> datetime:
+    """Extract explicit time from text and apply it to the date."""
+    # Time range like "2-5pm" → use start time (2pm)
+    range_match = TIME_RANGE_PATTERN.search(text)
+    if range_match:
+        hour = _parse_ampm_hour(int(range_match.group(1)), range_match.group(2))
+        return dt.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+    # "before 2PM" / "by 5pm"
+    before_match = BEFORE_TIME_PATTERN.search(text)
+    if before_match:
+        hour = _parse_ampm_hour(int(before_match.group(1)), before_match.group(2))
+        return dt.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+    # Simple time like "12PM", "2:30pm"
     match = QUIZ_TIME_PATTERN.search(text)
     if not match:
         return dt
-    parsed_time = dateparser.parse(
-        match.group(0),
-        settings=_dateparser_settings(now),
-    )
+    parsed_time = dateparser.parse(match.group(0), settings=_dateparser_settings(now))
     if not parsed_time:
         return dt
     parsed_time = _ensure_utc(parsed_time)
@@ -504,49 +533,49 @@ def detect_course(text: str) -> Optional[str]:
 
 def detect_due_date(text: str, now: datetime) -> Optional[datetime]:
     lower = text.lower()
-
-    if "day after tomorrow" in lower:
-        return _finalize_due_date(
-            now.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=2),
-            now,
-        )
-    if any(token in lower for token in ["tomorrow", "tmr", "kal"]):
-        return _finalize_due_date(
-            now.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=1),
-            now,
-        )
-    if "today" in lower:
-        return _finalize_due_date(now, now)
-
-    for day_name, day_idx in WEEKDAY_TO_INDEX.items():
-        if re.search(rf"\b{day_name}\b", lower):
-            return _finalize_due_date(_next_weekday(now, day_idx), now)
-
-    settings = _dateparser_settings(now)
-    found_dates = search_dates(text, settings=settings)
     best: Optional[datetime] = None
-    if found_dates:
-        for _, candidate in found_dates:
-            if not candidate:
-                continue
-            candidate = _ensure_utc(candidate)
-            if _is_suspicious_due_date(candidate, text, now):
-                continue
-            if best is None or candidate > best:
-                best = candidate
+
+    # --- Step 1: detect the DAY (midnight placeholder) ---
+    if "day after tomorrow" in lower:
+        best = (now + timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+    elif any(token in lower for token in ["tomorrow", "tmr", "kal"]):
+        best = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    elif "today" in lower:
+        best = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if best is None:
+        for day_name, day_idx in WEEKDAY_TO_INDEX.items():
+            if re.search(rf"\b{day_name}\b", lower):
+                best = _next_weekday(now, day_idx)
+                break
+
+    if best is None:
+        settings = _dateparser_settings(now)
+        found_dates = search_dates(text, settings=settings)
+        if found_dates:
+            for _, candidate in found_dates:
+                if not candidate:
+                    continue
+                candidate = _ensure_utc(candidate)
+                if _is_suspicious_due_date(candidate, text, now):
+                    continue
+                if best is None or candidate > best:
+                    best = candidate
 
     if best is None:
         best = _parse_text_date(text, now)
 
     if best is None:
-        parsed = dateparser.parse(text, settings=settings)
+        parsed = dateparser.parse(text, settings=_dateparser_settings(now))
         if parsed and not _is_suspicious_due_date(parsed, text, now):
             best = _ensure_utc(parsed)
 
     if best is None:
         return None
 
+    # --- Step 2: apply explicit time if present (e.g. "12PM", "2-5pm") ---
     best = _apply_explicit_time(text, best, now)
+    # --- Step 3: if still midnight, default to end-of-day 23:59 ---
     return _finalize_due_date(best, now)
 
 

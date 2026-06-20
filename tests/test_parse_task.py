@@ -143,3 +143,27 @@ class TestRealWorldStudentMessages:
         assert result["due_date"].day == 12
         assert "3" in result["title"]
 
+
+class TestTimeParsing:
+    """Verify explicit times in messages override defaults."""
+
+    def test_time_range_2_to_5pm(self):
+        result = parse_task("Computer Networks Lab Exam 21 June Friday 2-5pm")
+        assert result["due_date"] is not None
+        assert result["due_date"].hour == 14  # 2pm
+
+    def test_tomorrow_12pm(self):
+        result = parse_task("Assignment 3 Deadline: tomorrow 12PM")
+        assert result["due_date"] is not None
+        assert result["due_date"].hour == 12  # noon
+
+    def test_before_2pm(self):
+        result = parse_task("Submit assignment before 2PM on 25 June 2026")
+        assert result["due_date"] is not None
+        assert result["due_date"].hour == 14
+
+    def test_no_time_defaults_to_end_of_day(self):
+        result = parse_task("quiz of automata will be on Monday")
+        assert result["due_date"] is not None
+        assert result["due_date"].hour == 23
+        assert result["due_date"].minute == 59
