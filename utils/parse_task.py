@@ -104,7 +104,7 @@ QUIZ_MATERIAL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 QUIZ_DURATION_PATTERN = re.compile(r"\b\d+\s*(?:hours?|hrs?|minutes?|mins?)\b", re.IGNORECASE)
-QUIZ_TIME_PATTERN = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", re.IGNORECASE)
+QUIZ_TIME_PATTERN = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", re.IGNORECASE)
 TIME_RANGE_PATTERN = re.compile(
     r"\b(\d{1,2})(?::\d{2})?\s*[-\u2013to]+\s*\d{1,2}(?::\d{2})?\s*(am|pm)\b",
     re.IGNORECASE,
@@ -192,7 +192,7 @@ TEXT_DATE_PATTERN = re.compile(
 
 DATEPARSER_SETTINGS = {
     "PREFER_DATES_FROM": "future",
-    "TIMEZONE": "UTC",
+    "TIMEZONE": "Asia/Karachi",
     "TO_TIMEZONE": "UTC",
     "RETURN_AS_TIMEZONE_AWARE": True,
 }
@@ -211,6 +211,8 @@ def _next_weekday(now: datetime, target_idx: int) -> datetime:
 
 def _ensure_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
+        # Assume naive dates are in PKT (UTC+5), then convert to UTC
+        dt = dt - timedelta(hours=5)
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
@@ -259,33 +261,45 @@ def _parse_ampm_hour(hour: int, ampm: str) -> int:
 
 def _apply_explicit_time(text: str, dt: datetime, now: datetime) -> datetime:
     """Extract explicit time from text and apply it to the date."""
+    pkt = timezone(timedelta(hours=5))
+    dt_pkt = dt.astimezone(pkt)
+
     # Time range like "2-5pm" → use start time (2pm)
     range_match = TIME_RANGE_PATTERN.search(text)
     if range_match:
         hour = _parse_ampm_hour(int(range_match.group(1)), range_match.group(2))
-        return dt.replace(hour=hour, minute=0, second=0, microsecond=0)
+        return dt_pkt.replace(hour=hour, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
 
     # "before 2PM" / "by 5pm"
     before_match = BEFORE_TIME_PATTERN.search(text)
     if before_match:
         hour = _parse_ampm_hour(int(before_match.group(1)), before_match.group(2))
-        return dt.replace(hour=hour, minute=0, second=0, microsecond=0)
+        return dt_pkt.replace(hour=hour, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
 
     # Simple time like "12PM", "2:30pm"
     match = QUIZ_TIME_PATTERN.search(text)
-    if not match:
-        return dt
-    parsed_time = dateparser.parse(match.group(0), settings=_dateparser_settings(now))
-    if not parsed_time:
-        return dt
-    parsed_time = _ensure_utc(parsed_time)
-    return dt.replace(hour=parsed_time.hour, minute=parsed_time.minute, second=0, microsecond=0)
+    if match:
+        hour = _parse_ampm_hour(int(match.group(1)), match.group(3))
+        minute = int(match.group(2)) if match.group(2) else 0
+        return dt_pkt.replace(hour=hour, minute=minute, second=0, microsecond=0).astimezone(timezone.utc)
+
+    return dt
 
 
 def _finalize_due_date(dt: datetime, now: datetime) -> datetime:
     dt = _ensure_utc(dt)
-    if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
-        dt = dt.replace(hour=23, minute=59, second=0, microsecond=0)
+    # If the time is exactly 00:00:00 UTC (from old logic) or 19:00:00 UTC (00:00 PKT),
+    # it means no explicit time was provided.
+    # Set it to 23:59 PKT, which is 18:59 UTC.
+    if (dt.hour == 0 and dt.minute == 0) or (dt.hour == 19 and dt.minute == 0):
+        if dt.hour == 0:
+            # It was 00:00 UTC. To make it 23:59 PKT of the SAME day in PKT, 
+            # we must set it to 18:59 UTC.
+            dt = dt.replace(hour=18, minute=59, second=0, microsecond=0)
+        else:
+            # It was 19:00 UTC (00:00 PKT). To make it 23:59 PKT of the 
+            # SAME day, we must add 23 hours and 59 minutes.
+            dt = dt + timedelta(hours=23, minutes=59)
     return dt
 
 
@@ -538,7 +552,7 @@ def detect_due_date(text: str, now: datetime) -> Optional[datetime]:
     # --- Step 1: detect the DAY (midnight placeholder) ---
     if "day after tomorrow" in lower:
         best = (now + timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
-    elif any(token in lower for token in ["tomorrow", "tmr", "kal"]):
+    elif any(token in lower for token in ["tomorrow", "tmr", "kal", "tommorow", "tommorrow"]):
         best = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     elif "today" in lower:
         best = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -594,7 +608,7 @@ def extract_title(text: str, task_type: str, course: Optional[str]) -> str:
         title = re.sub(rf"\b{re.escape(word)}\b", "", title, flags=re.IGNORECASE)
 
     title = re.sub(
-        r"\b(?:due|by|on|before|submit|submission|deadline|tomorrow|today)\b",
+        r"\b(?:due|by|on|before|submit|submission|deadline|tomorrow|tommorow|tommorrow|today)\b",
         "",
         title,
         flags=re.IGNORECASE,
@@ -712,13 +726,17 @@ def _normalize_due_date(
     now = now or _utc_now()
     try:
         dt = datetime.fromisoformat(str(due_date_str).replace("Z", "+00:00"))
+        # Groq returns naive local time (PKT).
+        is_midnight = (dt.hour == 0 and dt.minute == 0)
+        
         dt = _ensure_utc(dt)
 
         if _is_suspicious_due_date(dt, text, now):
             return None
 
-        if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
-            dt = dt.replace(hour=23, minute=59, second=0, microsecond=0)
+        if is_midnight:
+            # Default to 23:59 PKT (18:59 UTC)
+            dt = dt.replace(hour=18, minute=59, second=0, microsecond=0)
         return dt
     except (ValueError, TypeError) as e:
         logger.warning(f"Failed to parse due_date '{due_date_str}': {e}")
@@ -792,11 +810,19 @@ def _merge_parse_results(
     # A generic/missing title is imperfect but not review-critical.
     needs_review = date_uncertain or (due_date is None and confidence < 0.5)
 
+    has_explicit_time = True
+    if due_date:
+        if due_date.hour == 18 and due_date.minute == 59:
+            has_explicit_time = False
+        elif due_date.hour == 23 and due_date.minute == 59: # Legacy fallback
+            has_explicit_time = False
+
     return {
         "task_type": task_type,
         "course": course,
         "title": title,
         "due_date": due_date,
+        "has_explicit_time": has_explicit_time,
         "quiz_material": quiz_material if task_type == "quiz" else None,
         "quiz_duration": quiz_duration if task_type == "quiz" else None,
         "quiz_time": quiz_time if task_type == "quiz" else None,

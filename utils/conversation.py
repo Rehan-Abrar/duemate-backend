@@ -236,8 +236,16 @@ def handle_reply(db, conv: dict, reply_text: str) -> dict:
                 "prompt": "❓ I couldn't parse that date.\n\n" + DATE_PROMPT,
             }
 
+        has_explicit_time = True
+        if due_date:
+            if due_date.hour == 18 and due_date.minute == 59:
+                has_explicit_time = False
+            elif due_date.hour == 23 and due_date.minute == 59:
+                has_explicit_time = False
+
         updates: dict = {
             "parsed_due_date": due_date,
+            "has_explicit_time": has_explicit_time,
             "date_uncertain": False,
             "needs_review": False,
             "status": "pending",

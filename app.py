@@ -858,6 +858,7 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     "status": task_status,
                     "course_unresolved": course_unresolved,
                     "date_uncertain": parse_result.get("date_uncertain", False),
+                    "has_explicit_time": parse_result.get("has_explicit_time", True),
                     "course_resolution_method": course_resolution_method,
                     "source_key": source_key,
                     "is_forwarded": is_forwarded,

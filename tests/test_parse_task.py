@@ -63,7 +63,7 @@ class TestDeterministicExtraction:
         assert due.year == 2026
         assert due.month == 6
         assert due.day == 22
-        assert due.hour == 14
+        assert due.hour == 9  # 14:00 PKT -> 09:00 UTC
 
     def test_assignment_message_title(self):
         title = extract_title(ASSIGNMENT_MSG, "assignment", None)
@@ -89,7 +89,7 @@ class TestParseTaskIntegration:
         assert result["due_date"] is not None
         assert result["due_date"].month == 6
         assert result["due_date"].day == 22
-        assert result["due_date"].hour == 14
+        assert result["due_date"].hour == 9  # 14:00 PKT -> 09:00 UTC
         assert result["parse_method"] == "regex_fallback"
         assert result["needs_review"] is False
 
@@ -150,20 +150,20 @@ class TestTimeParsing:
     def test_time_range_2_to_5pm(self):
         result = parse_task("Computer Networks Lab Exam 21 June Friday 2-5pm")
         assert result["due_date"] is not None
-        assert result["due_date"].hour == 14  # 2pm
+        assert result["due_date"].hour == 9  # 2pm PKT -> 09:00 UTC
 
     def test_tomorrow_12pm(self):
         result = parse_task("Assignment 3 Deadline: tomorrow 12PM")
         assert result["due_date"] is not None
-        assert result["due_date"].hour == 12  # noon
+        assert result["due_date"].hour == 7  # 12pm noon PKT -> 07:00 UTC
 
     def test_before_2pm(self):
         result = parse_task("Submit assignment before 2PM on 25 June 2026")
         assert result["due_date"] is not None
-        assert result["due_date"].hour == 14
+        assert result["due_date"].hour == 9  # 2pm PKT -> 09:00 UTC
 
     def test_no_time_defaults_to_end_of_day(self):
         result = parse_task("quiz of automata will be on Monday")
         assert result["due_date"] is not None
-        assert result["due_date"].hour == 23
+        assert result["due_date"].hour == 18  # 23:59 PKT -> 18:59 UTC
         assert result["due_date"].minute == 59
