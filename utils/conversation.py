@@ -216,6 +216,8 @@ def handle_reply(db, conv: dict, reply_text: str) -> dict:
                 "parsed_course": course,
                 "course_unresolved": False,
                 "course_resolution_method": "conversation",
+                "needs_review": False,
+                "status": "pending",
             },
             "prompt": None,   # caller sends the confirmation
         }
