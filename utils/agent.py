@@ -259,7 +259,7 @@ def handle_agent_query(db, user_id: str, phone: str, message_text: str, intent: 
                 if due.tzinfo:
                     due_pkt = due.astimezone(_PKT)
                 else:
-                    due_pkt = due
+                    due_pkt = due.replace(tzinfo=timezone.utc).astimezone(_PKT)
                 due_str = due_pkt.strftime("%d %b at %I:%M %p")
             else:
                 due_str = "No due date"
