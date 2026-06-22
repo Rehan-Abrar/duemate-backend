@@ -12,42 +12,45 @@ The following diagram illustrates the lifecycle of an incoming WhatsApp message,
 
 ```mermaid
 graph TD
-    User([Student WhatsApp]) -->|Inbound Message| Webhook[app.py /webhook]
-    Webhook --> Auth{Verify Webhook Sig}
-    Auth -->|Valid| Dispatcher{Active Conversation?}
-    
-    %% Conversational State Flow
-    Dispatcher -->|Yes| ConvHandler[utils/conversation.py]
-    ConvHandler --> DBUpdate[Update Pending Task in DB]
-    DBUpdate --> ConfirmMsg[Format Confirmation PKT]
-    ConfirmMsg --> SendConf[send_text_message]
-    
-    %% Intent Classification Flow
-    Dispatcher -->|No| IntentRouter[utils/agent.py: classify_intent]
-    
-    %% Schedule Query Path (RAG)
-    IntentRouter -->|query_schedule / query_tasks / greeting| AgentEngine[utils/agent.py: handle_agent_query]
-    AgentEngine -->|query_schedule| RAGEngine[utils/rag.py: retrieve_schedule_context]
-    RAGEngine --> TimetableDB[(Local JSON: timetable/teachers)]
-    RAGEngine --> FormatReply[Format Timetable Text PKT]
-    FormatReply --> SendSchedule[send_text_message]
-    
-    %% New Task Creation Path
-    IntentRouter -->|save_task| TaskParser[utils/parse_task.py: parse_task]
-    TaskParser --> LLMOps{Groq API / Llama 70B}
-    LLMOps -->|Success| SavePending[Save to MongoDB]
-    LLMOps -->|Timeout/Error| FallbackRegex[Regex + Dateparser Fallback]
-    FallbackRegex --> SavePending
-    
-    %% Conversational Prompt Trigger
-    SavePending --> MissingCheck{Missing Course or Date?}
-    MissingCheck -->|Yes| ConvStart[Start Conversational State]
-    ConvStart --> SendPrompt[Send Clarification Menu]
-    MissingCheck -->|No| SendAck[Send Standard Acknowledgment]
+    subgraph Ingress Layer
+        User([Student WhatsApp]) -->|Inbound Message| Webhook[app.py /webhook]
+        Webhook --> Auth{Verify Webhook Sig}
+        Auth -->|Valid| Dispatcher{Active Conversation?}
+    end
 
-    %% Dashboard Sync
-    SavePending -.->|Realtime Sync| Dashboard[Next.js Dashboard Vercel]
-    DBUpdate -.->|Realtime Sync| Dashboard
+    subgraph Conversation Engine
+        Dispatcher -->|Yes| ConvHandler[utils/conversation.py]
+        ConvHandler --> DBUpdate[Update Pending Task in DB]
+        DBUpdate --> ConfirmMsg[Format Confirmation PKT]
+        ConfirmMsg --> SendConf[send_text_message]
+    end
+
+    subgraph Intelligence Layer
+        Dispatcher -->|No| IntentRouter[utils/agent.py: classify_intent]
+        IntentRouter -->|query_schedule / query_tasks / greeting| AgentEngine[utils/agent.py: handle_agent_query]
+        AgentEngine -->|query_schedule| RAGEngine[utils/rag.py: retrieve_schedule_context]
+        
+        IntentRouter -->|save_task| TaskParser[utils/parse_task.py: parse_task]
+        TaskParser --> LLMOps{Groq API / Llama 70B}
+        TaskParser -->|Timeout/Error| FallbackRegex[Regex + Dateparser Fallback]
+    end
+
+    subgraph Execution Layer
+        LLMOps -->|Success| SavePending[Save to MongoDB]
+        FallbackRegex --> SavePending
+        
+        SavePending --> MissingCheck{Missing Course or Date?}
+        MissingCheck -->|Yes| ConvStart[Start Conversational State]
+        ConvStart --> SendPrompt[Send Clarification Menu]
+        MissingCheck -->|No| SendAck[Send Standard Acknowledgment]
+        
+        RAGEngine --> TimetableDB[(Local JSON: timetable/teachers)]
+        RAGEngine --> FormatReply[Format Timetable Text PKT]
+        FormatReply --> SendSchedule[send_text_message]
+        
+        SavePending -.->|Realtime Sync| Dashboard[Next.js Dashboard Vercel]
+        DBUpdate -.->|Realtime Sync| Dashboard
+    end
 ```
 
 ---
