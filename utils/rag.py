@@ -4,17 +4,25 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-# ── Data loading ──────────────────────────────────────────────────────────────
-_BASE_CANDIDATES = [
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data")),
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data")),
-]
-
 def _find_data_dir() -> str:
-    for path in _BASE_CANDIDATES:
-        if os.path.isdir(path):
+    """
+    Locate the data/ directory by checking multiple candidate paths.
+    Works both locally (data lives outside duemate-backend/) and on
+    Render (where only duemate-backend/ is deployed — data is inside it).
+    """
+    candidates = [
+        # 1. data/ sitting next to this utils/ folder, inside the backend repo (PRODUCTION)
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data")),
+        # 2. CWD/data — when app runs from the repo root
+        os.path.abspath(os.path.join(os.getcwd(), "data")),
+        # 3. data/ two levels up (local dev where data/ is at DueMate/data/)
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data")),
+    ]
+    for path in candidates:
+        if os.path.isdir(path) and os.path.exists(os.path.join(path, "timetable.json")):
             return path
-    return _BASE_CANDIDATES[0]
+    # Fallback — will fail gracefully in _load()
+    return candidates[0]
 
 def _load(filename: str) -> dict:
     path = os.path.join(_find_data_dir(), filename)
@@ -217,7 +225,7 @@ def retrieve_schedule_context(query: str) -> str:
     next_kws = ["next", "agle", "agli", "ongoing", "current", "now", "when", "class", "lecture"]
     is_next_class = any(re.search(fr'\b{kw}\b', q_clean) for kw in next_kws)
     
-    full_schedule_phrases = ["show timetable", "full schedule", "weekly schedule", "all classes"]
+    full_schedule_phrases = ["show timetable", "full schedule", "weekly schedule", "all classes", "timetable", "schedule"]
     is_full_schedule = any(phrase in q for phrase in full_schedule_phrases)
     
     # Check for specific days robustly

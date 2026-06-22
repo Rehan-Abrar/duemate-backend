@@ -1,0 +1,101 @@
+{
+    "schedule": {
+        "Monday": [
+            {
+                "time": "08:00-10:00",
+                "course": "AI Driven Software Development",
+                "instructor": "Mr. Zia ul Murtaza",
+                "room": "A-322"
+            },
+            {
+                "time": "11:00-14:00",
+                "course": "Parallel & Distributed Computing Lab",
+                "instructor": "Ms. Ramisha Farrukh",
+                "room": "Lab 2"
+            },
+            {
+                "time": "14:00-15:30",
+                "course": "Theory of Automata",
+                "instructor": "Mr. Khawar Iqbal",
+                "room": "B-105"
+            }
+        ],
+        "Tuesday": [
+            {
+                "time": "08:00-11:00",
+                "course": "AI Driven Software Development Lab",
+                "instructor": "Mr. Zia ul Murtaza",
+                "room": "Lab 8"
+            },
+            {
+                "time": "11:00-13:00",
+                "course": "Parallel & Distributed Computing",
+                "instructor": [
+                    "Ms. Ramisha Farrukh",
+                    "Prof. Dr. Sheheryar Malik"
+                ],
+                "room": "A-317"
+            }
+        ],
+        "Wednesday": [
+            {
+                "time": "08:00-11:00",
+                "course": "Computer Networks Lab",
+                "instructor": "Mr. Asim Mansha",
+                "room": "Lab 4"
+            },
+            {
+                "time": "11:00-13:00",
+                "course": "Entrepreneurship",
+                "instructor": [
+                    "Prof. Dr. Sheheryar Malik",
+                    "Ms. Zarmina Jahangir"
+                ],
+                "room": "A-317"
+            },
+            {
+                "time": "14:00-16:00",
+                "course": "Computer Networks",
+                "instructor": "Ms. Dua Mahmood",
+                "room": "Lab 3"
+            }
+        ],
+        "Thursday": [
+            {
+                "time": "11:00-13:00",
+                "course": "Entrepreneurship Lab",
+                "instructor": [
+                    "Prof. Dr. Sheheryar Malik",
+                    "Ms. Zarmina Jahangir"
+                ],
+                "room": "A-317"
+            },
+            {
+                "time": "14:00-17:00",
+                "course": "Problem Solving III",
+                "instructor": "Mr. Mateen",
+                "room": "Lab 1"
+            }
+        ],
+        "Friday": [
+            {
+                "time": "08:00-09:30",
+                "course": "Theory of Automata",
+                "instructor": "Mr. Khawar Iqbal",
+                "room": "A-317"
+            },
+            {
+                "time": "09:30-11:30",
+                "course": "Advance Database Management Systems",
+                "instructor": "Mr. Asim Mansha",
+                "room": "A-317"
+            },
+            {
+                "time": "14:00-17:00",
+                "course": "Advance Database Management Systems Lab",
+                "instructor": "Mr. Asim Mansha",
+                "room": "Lab 2"
+            }
+        ]
+    }
+}

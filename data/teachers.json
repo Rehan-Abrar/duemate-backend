@@ -1,0 +1,59 @@
+{
+    "teachers": [
+        {
+            "name": "Mr. Zia ul Murtaza",
+            "subjects": [
+                "AI Driven Software Development",
+                "AI Driven Software Development Lab"
+            ]
+        },
+        {
+            "name": "Ms. Ramisha Farrukh",
+            "subjects": [
+                "Parallel & Distributed Computing",
+                "Parallel & Distributed Computing Lab"
+            ]
+        },
+        {
+            "name": "Prof. Dr. Sheheryar Malik",
+            "subjects": [
+                "Parallel & Distributed Computing",
+                "Entrepreneurship",
+                "Entrepreneurship Lab"
+            ]
+        },
+        {
+            "name": "Mr. Khawar Iqbal",
+            "subjects": [
+                "Theory of Automata"
+            ]
+        },
+        {
+            "name": "Mr. Asim Mansha",
+            "subjects": [
+                "Computer Networks Lab",
+                "Advance Database Management Systems",
+                "Advance Database Management Systems Lab"
+            ]
+        },
+        {
+            "name": "Ms. Zarmina Jahangir",
+            "subjects": [
+                "Entrepreneurship",
+                "Entrepreneurship Lab"
+            ]
+        },
+        {
+            "name": "Ms. Dua Mahmood",
+            "subjects": [
+                "Computer Networks"
+            ]
+        },
+        {
+            "name": "Mr. Mateen",
+            "subjects": [
+                "Problem Solving III"
+            ]
+        }
+    ]
+}
