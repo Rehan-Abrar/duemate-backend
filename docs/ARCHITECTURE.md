@@ -6,6 +6,8 @@ DueMate is a hybrid deterministic-stateful academic assistant designed to automa
 
 ## 🗺️ High-Level System Architecture
 
+![System Architecture Diagram](architecture_diagram.png)
+
 The following diagram illustrates the lifecycle of an incoming WhatsApp message, highlighting the routing prioritization, database mutations, and external integrations.
 
 ```mermaid
