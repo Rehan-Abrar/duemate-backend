@@ -484,7 +484,7 @@ def get_mongo_client() -> Optional[MongoClient]:
     if not mongo_uri:
         return None
 
-    _mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=1500)
+    _mongo_client = MongoClient(mongo_uri, tz_aware=True, serverSelectionTimeoutMS=1500)
     return _mongo_client
 
 
@@ -777,7 +777,15 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                             due_date = updated_task.get("parsed_due_date") if updated_task else None
                             task_type = updated_task.get("task_type", "task") if updated_task else "task"
                             if due_date and hasattr(due_date, "strftime"):
-                                due_fmt = due_date.strftime("%b %d at %I:%M %p")
+                                from datetime import timedelta, timezone
+                                _PKT = timezone(timedelta(hours=5))
+                                # If naive, assume it's UTC (pymongo without tz_aware does this)
+                                # Or if it's aware, astimezone to PKT
+                                if due_date.tzinfo is None:
+                                    due_pkt = due_date.replace(tzinfo=timezone.utc).astimezone(_PKT)
+                                else:
+                                    due_pkt = due_date.astimezone(_PKT)
+                                due_fmt = due_pkt.strftime("%b %d at %I:%M %p")
                             elif due_date:
                                 due_fmt = str(due_date)[:16]
                             else:
