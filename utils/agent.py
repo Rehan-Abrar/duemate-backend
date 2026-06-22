@@ -238,24 +238,8 @@ def handle_agent_query(db, user_id: str, phone: str, message_text: str, intent: 
 
     # ── SCHEDULE QUERY (RAG) ──────────────────────────────────────────────────
     elif intent == "query_schedule":
-        now_pkt = datetime.now(_PKT)
-        context = retrieve_schedule_context(message_text)
-
-        system_prompt = (
-            f"You are the DueMate Academic Assistant. The current Pakistan Standard Time is "
-            f"{now_pkt.strftime('%I:%M %p on %A, %d %B %Y')}.\n\n"
-            "Answer the student's question concisely and accurately using ONLY the provided context.\n"
-            "Format your reply for WhatsApp: use *bold* for names and times, keep it under 5 lines.\n"
-            "If teacher names are listed, always name ALL of them.\n"
-            "If the information is not in the context, say so politely.\n\n"
-            f"Context:\n{context}"
-        )
-        try:
-            return _call_groq(system_prompt, f"Question: {message_text}")
-        except Exception as e:
-            logger.error("RAG generation failed: %s", e)
-            # Return raw context as fallback so the user still gets an answer
-            return f"Here's what I found:\n\n{context}"
+        # rag.py now has dedicated, time-aware handlers that return perfectly formatted text
+        return retrieve_schedule_context(message_text)
 
     # ── MY TASKS QUERY (DB) ───────────────────────────────────────────────────
     elif intent == "query_tasks":
@@ -282,14 +266,6 @@ def handle_agent_query(db, user_id: str, phone: str, message_text: str, intent: 
             formatted.append(f"{idx}. *{course}*: {title} — Due: {due_str}")
 
         task_list = "\n".join(formatted)
-        system_prompt = (
-            "You are the DueMate Assistant. Present the following pending tasks to the student "
-            "in a warm, encouraging WhatsApp message. Mention the dashboard for details. "
-            "Keep it short.\n\nTasks:\n" + task_list
-        )
-        try:
-            return _call_groq(system_prompt, "Show my tasks.")
-        except Exception:
-            return f"📋 *Your Pending Tasks:*\n\n{task_list}\n\nView & edit them on your dashboard!"
+        return f"📋 *Your Pending Tasks:*\n\n{task_list}\n\nView & edit them on your dashboard!"
 
     return "I'm not sure how to help with that. Try asking about your timetable or assignments!"

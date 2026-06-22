@@ -1,22 +1,6 @@
-"""
-RAG (Retrieval-Augmented Generation) module for DueMate.
-
-Loads timetable.json and teachers.json from the data/ directory and
-returns a rich, structured context string for the LLM to answer
-schedule-related questions accurately.
-
-Key capabilities:
-  - Teacher lookup: "who teaches PDC?"
-  - Day schedule:   "what classes on Monday?"
-  - Course lookup:  "when is ADBMS?" → all days/times for that course
-  - Next class:     "when is my next class?" → time-aware (PKT)
-  - Room lookup:    "where is CN lab?"
-"""
-
-from __future__ import annotations
-
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -40,27 +24,25 @@ def _load(filename: str) -> dict:
     except Exception:
         return {}
 
-# ── Alias table: short user keywords → canonical course name fragments ────────
-_COURSE_ALIASES: dict[str, list[str]] = {
-    "ai":             ["ai driven", "aisd", "zia", "murtaza"],
-    "pdc":            ["parallel", "distributed", "pdc", "ramisha", "sheheryar"],
-    "cn":             ["computer networks", "cn", "dua mahmood", "asim mansha", "networks lab"],
-    "dbms":           ["database", "dbms", "adbms", "advance database", "asim mansha"],
-    "automata":       ["automata", "toa", "khawar"],
-    "entrepreneurship": ["entrepreneurship", "te", "tech ent", "zarmina"],
-    "problem":        ["problem solving", "mateen", "ps3", "ps iii"],
+# ── Course Aliases ────────────────────────────────────────────────────────────
+_COURSE_ALIASES = {
+    "AI Driven Software Development": ["ai", "software", "development", "aisd", "zia", "murtaza", "ai driven"],
+    "Parallel & Distributed Computing": ["pdc", "parallel", "distributed", "computing", "ramisha", "sheheryar"],
+    "Computer Networks": ["cn", "networks", "computer", "dua mahmood", "dua", "asim", "networks lab"],
+    "Advance Database Management Systems": ["dbms", "database", "adbms", "advance database", "asim", "mansha"],
+    "Theory of Automata": ["automata", "toa", "khawar", "iqbal"],
+    "Entrepreneurship": ["entrepreneurship", "te", "tech", "techno", "technology", "zarmina"],
+    "Problem Solving III": ["problem", "solving", "mateen", "ps3", "ps iii"]
 }
 
 _DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
 _PKT = timezone(timedelta(hours=5))
 
-
 def _now_pkt() -> datetime:
     return datetime.now(_PKT)
 
-
 def _parse_slot_start(time_str: str) -> Optional[int]:
-    """Return slot start as minutes-since-midnight, or None."""
+    """Return slot start as minutes-since-midnight."""
     try:
         start = time_str.split("-")[0].strip()
         h, m = start.split(":")
@@ -68,176 +50,212 @@ def _parse_slot_start(time_str: str) -> Optional[int]:
     except Exception:
         return None
 
+def _format_time_12h(time_str: str) -> str:
+    try:
+        start, end = time_str.split("-")
+        def t12(t):
+            h, m = map(int, t.strip().split(":"))
+            ampm = "AM" if h < 12 else "PM"
+            h12 = h % 12 or 12
+            return f"{h12}:{m:02d} {ampm}"
+        return f"{t12(start)} - {t12(end)}"
+    except Exception:
+        return time_str
 
-def _match_courses(query: str) -> list[str]:
-    """Return list of alias keys whose keywords appear in the query."""
+def _resolve_courses(query: str) -> list[str]:
+    """Return canonical course names based on keywords in query."""
     q = query.lower()
-    matched = []
-    for key, keywords in _COURSE_ALIASES.items():
-        if any(kw in q for kw in keywords):
-            matched.append(key)
-    return matched
+    # Replace punctuation
+    q = re.sub(r'[^a-z0-9\s]', ' ', q)
+    words = set(q.split())
+    
+    matched = set()
+    for canonical, aliases in _COURSE_ALIASES.items():
+        # Exact word match for short aliases (like "ai", "cn", "te")
+        # Substring match for longer ones
+        for alias in aliases:
+            if len(alias) <= 3:
+                if alias in words:
+                    matched.add(canonical)
+            else:
+                if alias in q:
+                    matched.add(canonical)
+    return list(matched)
 
-
-def _course_matches_key(course_name: str, keys: list[str]) -> bool:
-    cn = course_name.lower()
-    for key in keys:
-        for kw in _COURSE_ALIASES[key]:
-            if kw in cn:
-                return True
-    return False
-
-
-def _format_slot(slot: dict) -> str:
+def _format_slot(slot: dict, day: str) -> str:
     instructors = slot.get("instructor", "")
     if isinstance(instructors, list):
         instructors = " & ".join(instructors)
-    return f"  {slot['time']} | {slot['course']} | Room: {slot.get('room','?')} | {instructors}"
+    return f"{slot['course']}\n{day}, {_format_time_12h(slot['time'])}\nRoom: {slot.get('room','?')}\nInstructor: {instructors}"
 
+# ── Handlers ──────────────────────────────────────────────────────────────────
 
-# ── Public retrieval function ─────────────────────────────────────────────────
+def _get_next_class(timetable: dict, courses: list[str]) -> str:
+    now = _now_pkt()
+    current_day = now.strftime("%A")
+    current_minutes = now.hour * 60 + now.minute
+    
+    schedule = timetable.get("schedule", {})
+    day_index = _DAY_ORDER.index(current_day) if current_day in _DAY_ORDER else 0
+    
+    for offset in range(7):
+        day = _DAY_ORDER[(day_index + offset) % len(_DAY_ORDER)]
+        day_slots = schedule.get(day, [])
+        
+        # Filter slots by course if specified
+        valid_slots = []
+        for slot in day_slots:
+            if not courses:
+                valid_slots.append(slot)
+            else:
+                slot_course = slot.get("course", "").lower()
+                if any(c.lower() in slot_course for c in courses):
+                    valid_slots.append(slot)
+                    
+        # Sort by start time
+        valid_slots.sort(key=lambda s: _parse_slot_start(s.get("time", "")) or 0)
+        
+        for slot in valid_slots:
+            start_min = _parse_slot_start(slot.get("time", ""))
+            if start_min is None:
+                continue
+            if offset == 0 and start_min <= current_minutes:
+                continue # Already started/passed
+                
+            prefix = "Next class:" if not courses else f"Next {courses[0]} class:"
+            return f"*{prefix}*\n" + _format_slot(slot, day)
+            
+    if courses:
+        return f"No upcoming classes found for {', '.join(courses)}."
+    return "No upcoming classes found for the rest of the week."
+
+def _get_course_schedule(timetable: dict, courses: list[str]) -> str:
+    schedule = timetable.get("schedule", {})
+    found = []
+    for day in _DAY_ORDER:
+        for slot in schedule.get(day, []):
+            slot_course = slot.get("course", "").lower()
+            if any(c.lower() in slot_course for c in courses):
+                found.append((day, slot))
+                
+    if not found:
+        return f"I couldn't find a class matching those courses."
+        
+    res = f"📅 *Schedule for {', '.join(courses)}:*\n\n"
+    for day, slot in found:
+        res += _format_slot(slot, day) + "\n\n"
+    return res.strip()
+
+def _get_teacher_info(teachers_data: dict, timetable: dict, query: str, courses: list[str]) -> str:
+    teacher_list = teachers_data.get("teachers", [])
+    q = query.lower()
+    
+    matched_teachers = []
+    for t in teacher_list:
+        name = t["name"].lower()
+        if any(part in q for part in name.split() if len(part) > 2):
+            matched_teachers.append(t)
+            continue
+        
+        # If we didn't match by name, see if we matched by course and they teach it
+        for c in courses:
+            if any(c.lower() in sub.lower() for sub in t.get("subjects", [])):
+                if t not in matched_teachers:
+                    matched_teachers.append(t)
+                    
+    if not matched_teachers:
+        return "I couldn't find any instructors matching your query."
+        
+    res = ""
+    for t in matched_teachers:
+        res += f"👨‍🏫 *{t['name']}*\nTeaches: {', '.join(t.get('subjects', []))}\n"
+        # Find their schedule
+        slots_found = []
+        for day in _DAY_ORDER:
+            for slot in timetable.get("schedule", {}).get(day, []):
+                instr = slot.get("instructor", "")
+                instr_str = " & ".join(instr) if isinstance(instr, list) else str(instr)
+                if t["name"].lower() in instr_str.lower():
+                    slots_found.append(f"• {day}, {_format_time_12h(slot['time'])} ({slot['course']} in {slot.get('room','?')})")
+        if slots_found:
+            res += "Schedule:\n" + "\n".join(slots_found) + "\n\n"
+    return res.strip()
+
+def _get_day_schedule(timetable: dict, day: str) -> str:
+    slots = timetable.get("schedule", {}).get(day, [])
+    if not slots:
+        return f"No classes scheduled for {day}."
+        
+    res = f"📅 *{day} Schedule:*\n\n"
+    for slot in sorted(slots, key=lambda s: _parse_slot_start(s.get("time", "")) or 0):
+        res += _format_slot(slot, day) + "\n\n"
+    return res.strip()
+
+def _get_full_timetable(timetable: dict) -> str:
+    res = "📅 *Full Weekly Timetable:*\n\n"
+    for day in _DAY_ORDER:
+        slots = timetable.get("schedule", {}).get(day, [])
+        if slots:
+            res += f"*{day}*\n"
+            for slot in sorted(slots, key=lambda s: _parse_slot_start(s.get("time", "")) or 0):
+                res += f"• {_format_time_12h(slot['time'])}: {slot['course']} ({slot.get('room','?')})\n"
+            res += "\n"
+    return res.strip()
+
+# ── Main Entry ────────────────────────────────────────────────────────────────
 
 def retrieve_schedule_context(query: str) -> str:
-    """
-    Entry point for the agent. Returns a rich, structured context string
-    ready to be injected into the LLM system prompt.
-    """
     timetable = _load("timetable.json")
     teachers_data = _load("teachers.json")
-    schedule: dict[str, list] = timetable.get("schedule", {})
-    teacher_list: list[dict] = teachers_data.get("teachers", [])
-
+    
     q = query.lower()
-    chunks: list[str] = []
-
-    # ── Detect query type ─────────────────────────────────────────────────────
-    is_teacher_query = any(w in q for w in ["who teach", "teaches", "teacher", "instructor", "sir", "ma'am", "madam", "ki class", "sahib"])
-    is_next_class    = any(w in q for w in ["next class", "next lecture", "agle class", "agli class", "next session", "next slot"])
-    is_today_query   = any(w in q for w in ["today", "aaj"])
-    is_tomorrow_query = any(w in q for w in ["tomorrow", "kal", "parson"])
-    is_room_query    = any(w in q for w in ["room", "where", "kahan", "lab", "location"])
-
-    # Detect explicit days in query
+    courses = _resolve_courses(q)
+    
+    is_teacher_query = any(w in q for w in ["who teach", "teaches", "teacher", "instructor", "sir", "ma'am", "madam", "prof"])
+    is_next_class = "next" in q.split() or "agle" in q.split() or "agli" in q.split()
+    is_full_schedule = any(w in q for w in ["show timetable", "full schedule", "weekly schedule", "all classes"])
+    
+    # Check for specific days
     day_map = {d.lower(): d for d in _DAY_ORDER}
-    mentioned_days = [day_map[w] for w in day_map if w in q]
-
-    matched_keys = _match_courses(q)
-
-    # ── 1. Teacher queries ────────────────────────────────────────────────────
-    if is_teacher_query or (matched_keys and not is_next_class and not mentioned_days and not is_today_query):
-        relevant = []
-        for t in teacher_list:
-            name = t["name"]
-            subjects = t.get("subjects", [])
-            # direct name mention
-            if any(part.lower() in q for part in name.lower().split()):
-                relevant.append(t)
-                continue
-            # matched via course alias
-            if matched_keys and _course_matches_key(" ".join(subjects), matched_keys):
-                relevant.append(t)
-                continue
-            # generic keyword overlap
-            if any(sub.lower() in q or any(kw in sub.lower() for kw in q.split()) for sub in subjects):
-                relevant.append(t)
-
-        # Also pull timetable slots for those courses so we know days/times
-        if relevant:
-            teacher_block = "📋 *Teacher Information:*\n"
-            for t in relevant:
-                subs = ", ".join(t["subjects"])
-                teacher_block += f"  • *{t['name']}* teaches: {subs}\n"
-
-                # Find their schedule slots
-                slots_found = []
-                for day, slots in schedule.items():
-                    for slot in slots:
-                        instr = slot.get("instructor", "")
-                        instr_str = " & ".join(instr) if isinstance(instr, list) else str(instr)
-                        if t["name"].lower() in instr_str.lower():
-                            slots_found.append(f"    - {day}: {slot['time']} | {slot['course']} | Room {slot.get('room','?')}")
-                if slots_found:
-                    teacher_block += "  📅 Schedule:\n" + "\n".join(slots_found) + "\n"
-            chunks.append(teacher_block)
-
-    # ── 2. Next class (time-aware) ────────────────────────────────────────────
+    mentioned_days = [day_map[w] for w in day_map if w in q.split()]
+    if "today" in q or "aaj" in q:
+        today = _now_pkt().strftime("%A")
+        if today in _DAY_ORDER: mentioned_days.append(today)
+    if "tomorrow" in q or "kal" in q:
+        today = _now_pkt().strftime("%A")
+        if today in _DAY_ORDER:
+            idx = (_DAY_ORDER.index(today) + 1) % len(_DAY_ORDER)
+            mentioned_days.append(_DAY_ORDER[idx])
+            
+    # 1. Full timetable explicitly requested
+    if is_full_schedule:
+        return _get_full_timetable(timetable)
+        
+    # 2. Next class (with or without course)
     if is_next_class:
-        now = _now_pkt()
-        current_day_name = now.strftime("%A")
-        current_minutes = now.hour * 60 + now.minute
-
-        # Build an ordered list of (day, slot) tuples starting from today
-        ordered = []
-        day_index = _DAY_ORDER.index(current_day_name) if current_day_name in _DAY_ORDER else 0
-        for offset in range(7):
-            day = _DAY_ORDER[(day_index + offset) % len(_DAY_ORDER)]
-            for slot in schedule.get(day, []):
-                slot_start = _parse_slot_start(slot.get("time", ""))
-                if slot_start is None:
-                    continue
-                # If it's today, only show future slots
-                if offset == 0 and slot_start <= current_minutes:
-                    continue
-                ordered.append((day, slot))
-            if ordered:
-                break  # found next class on this day
-
-        if ordered:
-            block = f"⏰ *Next Upcoming Class* (current PKT time: {now.strftime('%H:%M on %A')}):\n"
-            for day, slot in ordered[:3]:  # show up to 3 slots on next day
-                block += _format_slot(slot) + f"  ({day})\n"
-            chunks.append(block)
-        else:
-            chunks.append("No upcoming classes found for the rest of the week.")
-
-    # ── 3. Specific day schedule ──────────────────────────────────────────────
-    target_days = []
+        return _get_next_class(timetable, courses)
+        
+    # 3. Teacher info
+    if is_teacher_query:
+        return _get_teacher_info(teachers_data, timetable, q, courses)
+        
+    # 4. Specific day
+    if mentioned_days and not courses:
+        res = []
+        for d in set(mentioned_days):
+            res.append(_get_day_schedule(timetable, d))
+        return "\n\n".join(res)
+        
+    # 5. Specific course
+    if courses:
+        return _get_course_schedule(timetable, courses)
+        
+    # 6. Specific day fallback (if both day and course, course takes priority above, but we can combine if needed)
     if mentioned_days:
-        target_days = mentioned_days
-    elif is_today_query:
-        now = _now_pkt()
-        today = now.strftime("%A")
-        if today in schedule:
-            target_days = [today]
-    elif is_tomorrow_query:
-        now = _now_pkt()
-        tomorrow_idx = (_DAY_ORDER.index(now.strftime("%A")) + 1) % len(_DAY_ORDER) if now.strftime("%A") in _DAY_ORDER else 0
-        target_days = [_DAY_ORDER[tomorrow_idx]]
-
-    if target_days:
-        for day in target_days:
-            day_slots = schedule.get(day, [])
-            if not day_slots:
-                chunks.append(f"No classes on *{day}*.")
-                continue
-            block = f"📅 *{day} Schedule:*\n"
-            for slot in day_slots:
-                block += _format_slot(slot) + "\n"
-            chunks.append(block)
-
-    # ── 4. Course-specific lookup (all days) ──────────────────────────────────
-    if matched_keys and not is_teacher_query:
-        course_slots: dict[str, list[str]] = {}
-        for day, slots in schedule.items():
-            for slot in slots:
-                if _course_matches_key(slot.get("course", ""), matched_keys):
-                    course_slots.setdefault(day, []).append(_format_slot(slot))
-
-        if course_slots:
-            block = "📚 *Matching Course Schedule:*\n"
-            for day in _DAY_ORDER:
-                if day in course_slots:
-                    block += f"  *{day}:*\n" + "\n".join(course_slots[day]) + "\n"
-            chunks.append(block)
-
-    # ── 5. Fallback: send full timetable ─────────────────────────────────────
-    if not chunks:
-        full = "📅 *Full Weekly Timetable:*\n"
-        for day in _DAY_ORDER:
-            if day in schedule:
-                full += f"\n*{day}:*\n"
-                for slot in schedule[day]:
-                    full += _format_slot(slot) + "\n"
-        return full
-
-    return "\n\n".join(chunks)
+        res = []
+        for d in set(mentioned_days):
+            res.append(_get_day_schedule(timetable, d))
+        return "\n\n".join(res)
+        
+    # Fallback if we really don't understand
+    return "I couldn't find specific schedule information for your query. Try asking 'when is next class', 'who teaches PDC', or 'show timetable'."
