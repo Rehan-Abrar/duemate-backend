@@ -753,34 +753,6 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                         upsert=True,
                     )
 
-                # ── Agent Intent Classification & Routing ──
-                from utils.agent import classify_intent, handle_agent_query
-                
-                # Check if the message is a task or a conversational query
-                intent = classify_intent(text_body)
-                app.logger.info("checking_intent text=%r intent=%s", text_body, intent)
-                
-                if intent in ("greeting", "query_schedule", "query_tasks"):
-                    app.logger.info("agent_handled_intent intent=%s from=%s message=%s", intent, sender, text_body[:50])
-                    summary["inbound_messages"] += 1
-                    
-                    # Let the agent RAG / DB tools answer the query
-                    agent_reply = handle_agent_query(db, user_id, normalized_sender or sender, text_body, intent)
-                    
-                    try:
-                        send_text_message(
-                            to_number=normalized_sender or sender,
-                            message_body=agent_reply,
-                            preview_url=False
-                        )
-                    except Exception as e:
-                        app.logger.warning("agent_reply_failed from=%s error=%s", sender, str(e))
-                    
-                    # Don't create a task, skip to next message
-                    continue
-                
-                app.logger.info("intent_save_task_proceeding_to_parse text=%s", repr(text_body))
-
                 # ── Conversational context: handle ongoing dialog first ────────
                 active_conv = get_active_conversation(db, normalized_sender or sender)
                 if active_conv:
@@ -828,6 +800,34 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     summary["inbound_messages"] += 1
                     continue
                 # ─────────────────────────────────────────────────────────────
+
+                # ── Agent Intent Classification & Routing ──
+                from utils.agent import classify_intent, handle_agent_query
+                
+                # Check if the message is a task or a conversational query
+                intent = classify_intent(text_body)
+                app.logger.info("checking_intent text=%r intent=%s", text_body, intent)
+                
+                if intent in ("greeting", "query_schedule", "query_tasks"):
+                    app.logger.info("agent_handled_intent intent=%s from=%s message=%s", intent, sender, text_body[:50])
+                    summary["inbound_messages"] += 1
+                    
+                    # Let the agent RAG / DB tools answer the query
+                    agent_reply = handle_agent_query(db, user_id, normalized_sender or sender, text_body, intent)
+                    
+                    try:
+                        send_text_message(
+                            to_number=normalized_sender or sender,
+                            message_body=agent_reply,
+                            preview_url=False
+                        )
+                    except Exception as e:
+                        app.logger.warning("agent_reply_failed from=%s error=%s", sender, str(e))
+                    
+                    # Don't create a task, skip to next message
+                    continue
+                
+                app.logger.info("intent_save_task_proceeding_to_parse text=%s", repr(text_body))
 
                 mapped_course = _resolve_course_from_mapping(db, user_id, source_key) if user_id else None
                 parse_result = parse_task(text_body, course_hint=mapped_course)
