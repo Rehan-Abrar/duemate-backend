@@ -50,6 +50,15 @@ def _parse_slot_start(time_str: str) -> Optional[int]:
     except Exception:
         return None
 
+def _parse_slot_end(time_str: str) -> Optional[int]:
+    """Return slot end as minutes-since-midnight."""
+    try:
+        end = time_str.split("-")[1].strip()
+        h, m = end.split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
+
 def _format_time_12h(time_str: str) -> str:
     try:
         start, end = time_str.split("-")
@@ -117,10 +126,17 @@ def _get_next_class(timetable: dict, courses: list[str]) -> str:
         
         for slot in valid_slots:
             start_min = _parse_slot_start(slot.get("time", ""))
-            if start_min is None:
+            end_min = _parse_slot_end(slot.get("time", ""))
+            if start_min is None or end_min is None:
                 continue
-            if offset == 0 and start_min <= current_minutes:
-                continue # Already started/passed
+                
+            if offset == 0:
+                if end_min <= current_minutes:
+                    continue # Already passed
+                if start_min <= current_minutes < end_min:
+                    # Class is currently ongoing
+                    prefix = "Current class:" if not courses else f"Current {courses[0]} class:"
+                    return f"*{prefix}*\n" + _format_slot(slot, day)
                 
             prefix = "Next class:" if not courses else f"Next {courses[0]} class:"
             return f"*{prefix}*\n" + _format_slot(slot, day)
@@ -209,19 +225,27 @@ def retrieve_schedule_context(query: str) -> str:
     teachers_data = _load("teachers.json")
     
     q = query.lower()
+    q_clean = re.sub(r'[^a-z0-9\s]', ' ', q)
+    q_words = set(q_clean.split())
     courses = _resolve_courses(q)
     
-    is_teacher_query = any(w in q for w in ["who teach", "teaches", "teacher", "instructor", "sir", "ma'am", "madam", "prof"])
-    is_next_class = "next" in q.split() or "agle" in q.split() or "agli" in q.split()
-    is_full_schedule = any(w in q for w in ["show timetable", "full schedule", "weekly schedule", "all classes"])
+    teacher_kws = {"teach", "teaches", "teacher", "teaching", "instructor", "sir", "ma'am", "madam", "prof"}
+    is_teacher_query = "who" in q_words or any(kw in q_words for kw in teacher_kws)
     
-    # Check for specific days
+    next_kws = {"next", "agle", "agli", "ongoing", "current", "now"}
+    is_next_class = any(kw in q_words for kw in next_kws)
+    
+    full_schedule_phrases = ["show timetable", "full schedule", "weekly schedule", "all classes"]
+    is_full_schedule = any(phrase in q for phrase in full_schedule_phrases)
+    
+    # Check for specific days robustly
     day_map = {d.lower(): d for d in _DAY_ORDER}
-    mentioned_days = [day_map[w] for w in day_map if w in q.split()]
-    if "today" in q or "aaj" in q:
+    mentioned_days = [day_map[w] for w in day_map if w in q_words]
+    
+    if "today" in q_words or "aaj" in q_words:
         today = _now_pkt().strftime("%A")
         if today in _DAY_ORDER: mentioned_days.append(today)
-    if "tomorrow" in q or "kal" in q:
+    if "tomorrow" in q_words or "kal" in q_words:
         today = _now_pkt().strftime("%A")
         if today in _DAY_ORDER:
             idx = (_DAY_ORDER.index(today) + 1) % len(_DAY_ORDER)
