@@ -1425,6 +1425,112 @@ def create_app() -> Flask:
         
         return jsonify(_serialize_user_profile(user)), 200
 
+    @app.post("/api/student/tasks/extract")
+    def student_tasks_extract():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        data = request.get_json(silent=True) or {}
+        message_body = str(data.get("message", "")).strip()
+        if not message_body:
+            return jsonify({"error": "message_required"}), 400
+
+        try:
+            user_id = user.get("user_id")
+            source_key = "web_extract"
+            mapped_course = _resolve_course_from_mapping(db, user_id, source_key) if user_id else None
+            
+            parse_result = parse_task(message_body, course_hint=mapped_course)
+            
+            task_status = "needs_review" if parse_result["needs_review"] else "pending"
+            course_unresolved = _is_course_unresolved(parse_result.get("course"), source_key)
+            course_resolution_method = "mapped" if mapped_course else ("heuristic" if parse_result.get("course") else "unresolved")
+
+            fingerprint = make_fingerprint(
+                user_id=user_id,
+                course=parse_result.get("course"),
+                title=parse_result.get("title"),
+                due_date=parse_result.get("due_date")
+            )
+            is_potential_duplicate = check_duplicate(db, user_id, fingerprint)
+
+            task_doc = {
+                "user_id": user_id,
+                "phone_number": user.get("phone_number"),
+                "task_type": parse_result["task_type"],
+                "raw_message": message_body,
+                "fingerprint": fingerprint,
+                "is_potential_duplicate": is_potential_duplicate,
+                "parsed_course": parse_result["course"],
+                "parsed_title": parse_result["title"],
+                "parsed_due_date": parse_result["due_date"],
+                "quiz_material": parse_result["quiz_material"],
+                "quiz_duration": parse_result["quiz_duration"],
+                "quiz_time": parse_result["quiz_time"],
+                "parse_confidence": parse_result["confidence"],
+                "parse_method": parse_result.get("parse_method", "unknown"),
+                "groq_raw_response": parse_result.get("groq_raw_response"),
+                "needs_review": parse_result["needs_review"],
+                "status": task_status,
+                "course_unresolved": course_unresolved,
+                "date_uncertain": parse_result.get("date_uncertain", False),
+                "has_explicit_time": parse_result.get("has_explicit_time", True),
+                "course_resolution_method": course_resolution_method,
+                "source_key": source_key,
+                "is_forwarded": False,
+                "forwarded_from": None,
+                "course_mapped_from_source": bool(mapped_course),
+                "source_message_id": None,
+                "source_request_id": None,
+                "created_at": _utc_now(),
+                "updated_at": _utc_now(),
+            }
+
+            try:
+                db.tasks.insert_one(task_doc)
+            except DuplicateKeyError:
+                # Same behavior as the WhatsApp flow: duplicate detected → don't insert again
+                # Return the is_potential_duplicate flag so the frontend can inform the user
+                return jsonify({
+                    "error": "duplicate_task",
+                    "message": "This task has already been saved.",
+                    "is_potential_duplicate": True,
+                }), 409
+
+            return jsonify({"item": _serialize_for_json(task_doc)})
+        except Exception as exc:
+            app.logger.exception("student_tasks_extract_failed error=%s", str(exc))
+            return jsonify({"error": "parse_failed", "detail": str(exc)}), 500
+
+    @app.patch("/api/user/settings")
+    def update_user_settings():
+        db = get_mongo_db()
+        if db is None:
+            return make_error_response("database_not_configured", status_code=503)
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        data = request.get_json(silent=True) or {}
+        
+        current_settings = user.get("settings") or {}
+        for key, val in data.items():
+            current_settings[key] = val
+
+        db.users.update_one(
+            {"user_id": user.get("user_id")},
+            {"$set": {"settings": current_settings, "updated_at": _utc_now()}}
+        )
+
+        updated_user = db.users.find_one({"user_id": user.get("user_id")})
+        return jsonify(_serialize_user_profile(updated_user)), 200
+
     @app.get("/api/messages/recent")
     @admin_auth_required
     def recent_messages():
@@ -2139,6 +2245,49 @@ def create_app() -> Flask:
 
         result = db.course_source_mappings.delete_one({"user_id": user_id, "source_key": source_key})
         return jsonify({"deleted": result.deleted_count > 0, "source_key": source_key})
+
+    @app.get("/api/student/timetable")
+    def get_student_timetable():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        from utils.rag import _load
+        timetable = _load("timetable.json")
+        return jsonify(timetable)
+
+    @app.post("/api/student/assistant/chat")
+    def assistant_chat():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        data = request.get_json(silent=True) or {}
+        message = str(data.get("message", "")).strip()
+        if not message:
+            return jsonify({"error": "message_required"}), 400
+
+        from utils.agent import classify_intent, handle_agent_query
+        intent = classify_intent(message)
+        reply = handle_agent_query(
+            db,
+            user.get("user_id"),
+            user.get("phone_number"),
+            message,
+            intent
+        )
+        return jsonify({
+            "reply": reply,
+            "intent": intent
+        })
 
     @app.get("/webhook")
     @app.get("/webhook/messages")

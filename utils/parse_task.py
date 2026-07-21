@@ -1013,7 +1013,7 @@ def _parse_with_regex_fallback(message_text: str, course_hint: Optional[str] = N
     return _merge_parse_results(deterministic, None, message_text, "regex_fallback")
 
 
-def parse_task(message_text: str, course_hint: Optional[str] = None) -> dict:
+def parse_task(message_text: str, course_hint: Optional[str] = None, db=None) -> dict:
     """
     Parse WhatsApp message into structured task details.
 
@@ -1030,6 +1030,7 @@ def parse_task(message_text: str, course_hint: Optional[str] = None) -> dict:
             message_text,
             deterministic["normalized_text"],
             now,
+            db=db,
         )
         parse_method = "groq"
         logger.info(
