@@ -314,7 +314,7 @@ def start_scheduler(db_getter) -> BackgroundScheduler:
     # Reminder check job - every 15 minutes
     def reminder_job():
         db = db_getter()
-        if db:
+        if db is not None:
             check_reminders(db)
     
     scheduler.add_job(
@@ -328,7 +328,7 @@ def start_scheduler(db_getter) -> BackgroundScheduler:
     # Weekly archive job - Sunday at 3 AM UTC
     def archive_job():
         db = db_getter()
-        if db:
+        if db is not None:
             archive_old_data(db)
     
     scheduler.add_job(

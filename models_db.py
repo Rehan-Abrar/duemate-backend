@@ -107,6 +107,9 @@ def ensure_indexes() -> None:
     # Course source mappings
     db.course_source_mappings.create_index([("user_id", 1), ("source_key", 1)], unique=True)
 
+    # User timetables — one document per user, stores ALL parsed sections
+    db.user_timetables.create_index("user_id", unique=True)
+
     _indexes_ready = True
     logger.info("MongoDB indexes created successfully")
 

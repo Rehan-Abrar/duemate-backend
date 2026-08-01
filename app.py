@@ -544,6 +544,8 @@ def ensure_mongo_indexes() -> None:
     db.archived_reminders_sent.create_index("user_id")
     db.archived_reminders_sent.create_index("sent_at")
     ensure_conversation_index(db)
+    # User timetables — one document per user, stores ALL parsed sections
+    db.user_timetables.create_index("user_id", unique=True)
     _indexes_ready = True
 
 
@@ -2246,8 +2248,13 @@ def create_app() -> Flask:
         result = db.course_source_mappings.delete_one({"user_id": user_id, "source_key": source_key})
         return jsonify({"deleted": result.deleted_count > 0, "source_key": source_key})
 
-    @app.get("/api/student/timetable")
-    def get_student_timetable():
+    @app.post("/api/student/timetable/upload")
+    def upload_student_timetable():
+        """
+        Upload a university timetable PDF. Parses ALL sections in-memory and
+        stores them in the user_timetables collection keyed by user_id.
+        Returns the list of detected sections so the user can choose one.
+        """
         db = get_mongo_db()
         if db is None:
             return jsonify({"error": "database_not_configured"}), 503
@@ -2256,9 +2263,178 @@ def create_app() -> Flask:
         if auth_error:
             return auth_error
 
-        from utils.rag import _load
-        timetable = _load("timetable.json")
-        return jsonify(timetable)
+        user_id = user.get("user_id")
+
+        # ── Validate file presence ────────────────────────────────────────
+        if "file" not in request.files:
+            return jsonify({"error": "no_file", "detail": "No file field in request."}), 400
+
+        pdf_file = request.files["file"]
+        if pdf_file.filename == "":
+            return jsonify({"error": "no_file", "detail": "No file selected."}), 400
+
+        # ── Size limit (20 MB) ────────────────────────────────────────────
+        pdf_bytes = pdf_file.read()
+        if len(pdf_bytes) > 20 * 1024 * 1024:
+            return jsonify({"error": "file_too_large", "detail": "Maximum PDF size is 20 MB."}), 413
+
+        if len(pdf_bytes) == 0:
+            return jsonify({"error": "empty_file", "detail": "Uploaded file is empty."}), 400
+
+        # ── Parse & validate layout ───────────────────────────────────────
+        try:
+            from utils.timetable_universal import UniversalTimetableParser, InvalidTimetableLayoutError
+            parser = UniversalTimetableParser(stream=pdf_bytes)
+        except Exception as exc:
+            app.logger.warning("timetable_upload: fitz open failed user=%s error=%s", user_id, exc)
+            return jsonify({
+                "error": "invalid_pdf",
+                "detail": "The uploaded file could not be opened as a PDF."
+            }), 400
+
+        if not parser.validate_layout():
+            return jsonify({
+                "error": "unsupported_layout",
+                "detail": (
+                    "This PDF does not look like a supported Riphah University grid-format timetable. "
+                    "Please upload the official timetable PDF with room labels, time columns, and section markers."
+                )
+            }), 422
+
+        # ── Extract all sections ──────────────────────────────────────────
+        try:
+            parsed_all = parser.parse_all()  # {section: [slot_dicts]}
+        except Exception as exc:
+            app.logger.exception("timetable_upload: parse_all failed user=%s error=%s", user_id, exc)
+            return jsonify({"error": "parse_failed", "detail": str(exc)}), 500
+
+        if not parsed_all:
+            return jsonify({
+                "error": "no_sections_found",
+                "detail": "No class sections were detected in this PDF."
+            }), 422
+
+        sections = sorted(parsed_all.keys())
+
+        # ── Persist to MongoDB (upsert — replaces any previous upload) ────
+        db.user_timetables.update_one(
+            {"user_id": user_id},
+            {"$set": {
+                "user_id": user_id,
+                "pdf_name": pdf_file.filename or "timetable.pdf",
+                "uploaded_at": _utc_now(),
+                "sections": parsed_all,
+                "selected_section": None,   # cleared until user selects
+            }},
+            upsert=True,
+        )
+
+        # Clear any previously saved section in user settings
+        db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {
+                "settings.timetable_section": None,
+                "settings.available_sections": sections,
+                "updated_at": _utc_now(),
+            }},
+        )
+
+        app.logger.info("timetable_upload: success user=%s sections=%s", user_id, sections)
+        return jsonify({"sections": sections}), 200
+
+    @app.post("/api/student/timetable/select")
+    def select_student_timetable_section():
+        """
+        Set the user's active timetable section.
+        No re-upload required — all sections are already stored from the last upload.
+        """
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        user_id = user.get("user_id")
+        data = request.get_json(silent=True) or {}
+        section = str(data.get("section", "")).strip()
+
+        if not section:
+            return jsonify({"error": "section_required"}), 400
+
+        doc = db.user_timetables.find_one({"user_id": user_id})
+        if not doc:
+            return jsonify({
+                "error": "no_timetable_uploaded",
+                "detail": "Please upload a timetable PDF first."
+            }), 404
+
+        if section not in doc.get("sections", {}):
+            return jsonify({
+                "error": "invalid_section",
+                "detail": f"Section '{section}' was not found in your uploaded timetable.",
+                "available": sorted(doc.get("sections", {}).keys()),
+            }), 400
+
+        slot_count = len(doc["sections"][section])
+
+        # Update selected_section in user_timetables
+        db.user_timetables.update_one(
+            {"user_id": user_id},
+            {"$set": {"selected_section": section}},
+        )
+
+        # Mirror to user.settings for AppShell initialisation on next login
+        db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {
+                "settings.timetable_section": section,
+                "updated_at": _utc_now(),
+            }},
+        )
+
+        app.logger.info("timetable_select: user=%s section=%s slots=%d", user_id, section, slot_count)
+        return jsonify({"section": section, "slots": slot_count}), 200
+
+    @app.get("/api/student/timetable")
+    def get_student_timetable():
+        """
+        Return the authenticated user's active timetable as a flat list of slots.
+        Only returns slots for the currently selected section.
+        Returns [] if no timetable has been uploaded or selected yet.
+        """
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        user_id = user.get("user_id")
+
+        doc = db.user_timetables.find_one({"user_id": user_id})
+        if not doc or not doc.get("selected_section"):
+            return jsonify([]), 200
+
+        section = doc["selected_section"]
+        raw_slots = doc.get("sections", {}).get(section, [])
+
+        # Rename 'instructor' → 'teacher' for frontend type compatibility
+        # (TimetableSlot uses slot.teacher, not slot.instructor)
+        slots = []
+        for s in raw_slots:
+            slots.append({
+                "day": s.get("day", ""),
+                "time": s.get("time", ""),
+                "course": s.get("course", ""),
+                "room": s.get("room", ""),
+                "teacher": s.get("instructor", ""),
+                "section": s.get("section", section),
+            })
+
+        return jsonify(slots), 200
 
     @app.post("/api/student/assistant/chat")
     def assistant_chat():

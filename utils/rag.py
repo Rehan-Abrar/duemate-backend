@@ -3,6 +3,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from collections import defaultdict
 
 def _find_data_dir() -> str:
     """
@@ -206,11 +207,71 @@ def _get_full_timetable(timetable: dict) -> str:
             res += "\n"
     return res.strip()
 
+# ── MongoDB-backed timetable loading ─────────────────────────────────────────
+
+def _load_user_timetable(db, user_id: str) -> dict:
+    """
+    Load the user's SELECTED section's slots from user_timetables collection.
+    Converts to {"schedule": {"Monday": [slots], ...}} shape expected by handlers.
+    Falls back to the legacy timetable.json file if db/user not available.
+    IMPORTANT: Always filters by selected_section — never returns mixed sections.
+    """
+    if db is None or not user_id:
+        return _load("timetable.json")
+
+    doc = db.user_timetables.find_one({"user_id": user_id})
+    if not doc or not doc.get("selected_section"):
+        return _load("timetable.json")  # legacy fallback
+
+    section = doc["selected_section"]
+    slots = doc.get("sections", {}).get(section, [])
+
+    schedule: dict = defaultdict(list)
+    for slot in slots:
+        schedule[slot["day"]].append(slot)
+
+    return {"schedule": dict(schedule)}
+
+
+def _build_teachers_from_timetable(timetable: dict) -> dict:
+    """
+    Derive teacher→courses mapping dynamically from the user's actual schedule.
+    Replaces the hardcoded teachers.json for multi-user support.
+    Returns a dict with the same shape as teachers.json so existing handlers work unchanged.
+    """
+    teachers: dict = {}
+    for day, slots in timetable.get("schedule", {}).items():
+        for slot in slots:
+            instr = slot.get("instructor", "")
+            course = slot.get("course", "")
+            if isinstance(instr, list):
+                instructors = instr
+            else:
+                instructors = [i.strip() for i in instr.split("/") if i.strip()]
+            for name in instructors:
+                if not name:
+                    continue
+                if name not in teachers:
+                    teachers[name] = set()
+                teachers[name].add(course)
+
+    return {
+        "teachers": [
+            {"name": name, "subjects": sorted(subjects)}
+            for name, subjects in teachers.items()
+        ]
+    }
+
+
 # ── Main Entry ────────────────────────────────────────────────────────────────
 
-def retrieve_schedule_context(query: str) -> str:
-    timetable = _load("timetable.json")
-    teachers_data = _load("teachers.json")
+def retrieve_schedule_context(query: str, db=None, user_id: str = None) -> str:
+    timetable = _load_user_timetable(db, user_id)
+    # Build teacher data from the user's actual timetable instead of static JSON
+    teachers_data = _build_teachers_from_timetable(timetable)
+    # Fall back to static teachers.json if no teachers were derived (e.g. legacy user)
+    if not teachers_data.get("teachers"):
+        teachers_data = _load("teachers.json")
     
     q = query.lower()
     q_clean = re.sub(r'[^a-z0-9\s]', ' ', q)

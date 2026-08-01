@@ -239,7 +239,7 @@ def handle_agent_query(db, user_id: str, phone: str, message_text: str, intent: 
     # ── SCHEDULE QUERY (RAG) ──────────────────────────────────────────────────
     elif intent == "query_schedule":
         # rag.py now has dedicated, time-aware handlers that return perfectly formatted text
-        return retrieve_schedule_context(message_text)
+        return retrieve_schedule_context(message_text, db=db, user_id=user_id)
 
     # ── MY TASKS QUERY (DB) ───────────────────────────────────────────────────
     elif intent == "query_tasks":
