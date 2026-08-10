@@ -129,6 +129,39 @@ def _sections_in_words(words: List) -> List[Dict]:
     return unique
 
 
+def _sections_in_words_strict(words: List) -> List[Dict]:
+    """
+    Strict (fullmatch-based) section detection for use inside _extract_page.
+
+    Only matches tokens that ARE section markers (e.g. '(BSCS-6B)', 'BSAI-2').
+    Does NOT use finditer or a sliding window, so it never creates phantom
+    section markers at wrong X positions from adjacent tokens.
+
+    This is critical for correct rectangle splitting: the broad approach
+    (finditer + 2-token window) generates ~3 entries per token at different
+    X coordinates, causing the clustering algorithm to split cells that
+    should remain whole, which loses lectures.
+    """
+    found = []
+    for w in words:
+        raw = w[4].strip()
+        clean = re.sub(r'[()\uff08\uff09\s,]', '', raw).strip()
+        if _SEC_PATTERN.fullmatch(raw) or _SEC_PATTERN.fullmatch(clean):
+            norm = _norm_section(clean)
+            cx = (w[0] + w[2]) / 2
+            cy = (w[1] + w[3]) / 2
+            found.append(dict(section=norm, x=cx, y=cy,
+                              x0=w[0], x1=w[2], y0=w[1], y1=w[3]))
+    seen_keys: set = set()
+    unique = []
+    for s in found:
+        k = (s['section'], round(s['x'], 0), round(s['y'], 0))
+        if k not in seen_keys:
+            seen_keys.add(k)
+            unique.append(s)
+    return unique
+
+
 def _sections_match(a: str, b: str) -> bool:
     return a == b
 
@@ -246,15 +279,103 @@ class UniversalTimetableParser:
 
     def parse_all(self) -> Dict[str, List[dict]]:
         """
+        Single-pass extraction: iterate through pages once and collect
+        lectures for ALL sections simultaneously.
+
+        This is dramatically faster than the previous approach which called
+        _parse_section() for every detected section (O(sections × pages)).
+        Now every page is processed exactly once (O(pages)).
+
         Returns {section: [slot_dicts]} for every section present in the PDF.
-        Each slot dict: {day, start_time, end_time, time, course, instructor, room, section}
         """
-        sections = self.get_all_sections()
+        all_lectures: Dict[str, List[Lecture]] = defaultdict(list)
+
+        for page_num in range(min(len(self.doc), 5)):
+            page = self.doc[page_num]
+            day = self.DAYS[page_num] if page_num < len(self.DAYS) else f"Day{page_num + 1}"
+
+            rects = self._rectangles(page)
+            slots = self._time_slots(page)
+            rooms = self._rooms(page)
+            time_keys = sorted(slots)
+
+            processed: Dict[tuple, Dict] = {}
+            for r in rects:
+                k = (round(r['x0'], 1), round(r['y0'], 1),
+                     round(r['x1'], 1), round(r['y1'], 1))
+                if k not in processed:
+                    processed[k] = r
+
+            for rect in processed.values():
+                words_all = self._words_in_rect(page, rect)
+                all_secs = _sections_in_words_strict(words_all)
+
+                if not all_secs:
+                    continue
+
+                if len(time_keys) > 1:
+                    col_widths = [time_keys[i + 1] - time_keys[i]
+                                  for i in range(len(time_keys) - 1)]
+                    min_col_w = min(col_widths)
+                else:
+                    min_col_w = 40.0
+
+                all_secs_sorted = sorted(all_secs, key=lambda s: s['x'])
+                clusters: List[Dict] = []
+                for s in all_secs_sorted:
+                    if not clusters or s['x'] - clusters[-1]['x'] > min_col_w * 0.8:
+                        clusters.append(s)
+
+                n = len(clusters)
+                if n == 1:
+                    sub_rects = [rect]
+                else:
+                    sub_rects = self._split_rect(
+                        rect, clusters, time_keys, words_all)
+
+                for sub in sub_rects:
+                    words_sub = self._words_in_rect(page, sub, x_margin=4)
+                    secs_sub = _sections_in_words_strict(words_sub)
+
+                    if not secs_sub:
+                        continue
+
+                    text = self._words_to_text(words_sub)
+                    unique_targets = set(s['section'] for s in secs_sub)
+
+                    room = self._room_for_rect(sub, rooms)
+                    start, end = self._time_for_rect(sub, slots)
+
+                    for target in unique_targets:
+                        parsed = self._parse_cell(text, target)
+                        if not parsed.get('course'):
+                            continue
+
+                        all_lectures[target].append(Lecture(
+                            day=day,
+                            room=room,
+                            start_time=start,
+                            end_time=end,
+                            course=parsed['course'],
+                            instructor=parsed.get('instructor', ''),
+                            section=parsed.get('section') or target,
+                        ))
+
+        # Deduplicate and convert per section
         result: Dict[str, List[dict]] = {}
-        for section in sections:
-            lectures = self._parse_section(section)
-            result[section] = [lec.to_dict() for lec in lectures]
+        for section, lectures in all_lectures.items():
+            seen, unique = set(), []
+            for lec in lectures:
+                k = (lec.course, lec.start_time, lec.room)
+                if k not in seen:
+                    seen.add(k)
+                    unique.append(lec)
+            unique.sort(key=lambda l: (
+                int(l.start_time.split(':')[0]) * 60 + int(l.start_time.split(':')[1])
+                if ':' in l.start_time else 0))
+            result[section] = [lec.to_dict() for lec in unique]
             logger.info("parse_all: section=%s slots=%d", section, len(result[section]))
+
         return result
 
     # ------------------------------------------------------------------
@@ -457,7 +578,24 @@ class UniversalTimetableParser:
         instructor = re.sub(r'\s+', ' ', instructor).strip()
         instructor = re.sub(r'\(?' + re.escape(sec) + r'\)?', '',
                             instructor).strip()
-        return dict(course=course, section=_norm_section(sec) or sec,
+        
+        # Handle compound section markers (e.g., "BSCS-5B, BSCGV-5, BSCGV-6")
+        if ',' in sec:
+            # Split into individual sections and normalize each
+            sections = [s.strip() for s in sec.split(',')]
+            norm_sections = [_norm_section(s) for s in sections]
+            # Check if target is in the list
+            norm_target = _norm_section(target)
+            if norm_target in norm_sections:
+                final_section = norm_target
+            else:
+                # Target not in list, use first normalized section
+                final_section = norm_sections[0] if norm_sections else target
+        else:
+            # Single section marker, normalize normally
+            final_section = _norm_section(sec) or sec
+        
+        return dict(course=course, section=final_section,
                     instructor=instructor)
 
     # ------------------------------------------------------------------
@@ -482,7 +620,7 @@ class UniversalTimetableParser:
 
         for rect in processed.values():
             words_all = self._words_in_rect(page, rect)
-            all_secs = _sections_in_words(words_all)
+            all_secs = _sections_in_words_strict(words_all)
 
             if not all_secs:
                 continue
@@ -509,7 +647,7 @@ class UniversalTimetableParser:
 
             for sub in sub_rects:
                 words_sub = self._words_in_rect(page, sub, x_margin=4)
-                secs_sub = _sections_in_words(words_sub)
+                secs_sub = _sections_in_words_strict(words_sub)
 
                 if not _target_in_secs(secs_sub, norm_target):
                     continue
