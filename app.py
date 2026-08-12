@@ -11,7 +11,7 @@ import uuid
 from typing import Optional
 from functools import wraps
 
-from flask import Flask, jsonify, request, g
+from flask import Flask, jsonify, request, g, Response
 from flask_cors import CORS
 from bson import ObjectId
 from pymongo import MongoClient
@@ -2435,6 +2435,47 @@ def create_app() -> Flask:
             })
 
         return jsonify(slots), 200
+
+    @app.get("/api/student/timetable/image")
+    def get_student_timetable_image():
+        """
+        Generate and return a PNG image of the user's timetable.
+        Returns the image as a downloadable file.
+        """
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        user_id = user.get("user_id")
+
+        doc = db.user_timetables.find_one({"user_id": user_id})
+        if not doc or not doc.get("selected_section"):
+            return jsonify({"error": "no_timetable"}), 404
+
+        section = doc["selected_section"]
+        raw_slots = doc.get("sections", {}).get(section, [])
+
+        if not raw_slots:
+            return jsonify({"error": "no_slots"}), 404
+
+        try:
+            from utils.schedule_image import render_schedule_image
+            image_bytes = render_schedule_image(raw_slots, section)
+        except Exception as exc:
+            app.logger.exception("timetable_image: render failed user=%s error=%s", user_id, exc)
+            return jsonify({"error": "image_generation_failed", "detail": str(exc)}), 500
+
+        return Response(
+            image_bytes,
+            mimetype="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="duemate_schedule_{section}.png"'
+            },
+        )
 
     @app.post("/api/student/assistant/chat")
     def assistant_chat():
