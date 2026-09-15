@@ -69,26 +69,25 @@ _MY_TASKS_WORDS = {
     "tasks do i", "what homework", "what quiz", "what assignment",
 }
 
-# Keywords that signal a schedule / timetable question
+# Keywords that signal a schedule / timetable question.
+# NOTE: these are generic schedule vocabulary only — no course-specific terms
+# (e.g. "pdc class") so the classifier works for any program/semester/section.
 _SCHEDULE_WORDS = {
     "who teaches", "who is the teacher", "teacher", "instructor", "teaches",
-    "sir", "ma'am", "madam", "prof", "professor", "lecture", "class",
+    "sir", "ma'am", "madam", "prof", "professor", "lecture", "class", "classes",
     "timetable", "schedule", "timing", "when is", "where is", "room",
     "lab room", "next class", "today class", "what time", "kab hai",
-    "kahan hai", "which room", "agli class", "agle class", "aaj class",
-    "pdc class", "cn class", "ai class", "dbms class", "toa class",
-    "automata class", "entrepreneurship class",
+    "kahan hai", "which room", "which class", "agli class", "agle class", "aaj class",
 }
 
-# Course/teacher names that strongly signal a schedule question
+# Generic patterns that strongly signal a schedule question (no hardcoded courses).
 _SCHEDULE_ENTITY_PATTERNS = [
     r"\bwho\b.*(teach|sir|madam|prof|instructor)",
     r"\bwhen\b.*(class|lecture|lab|session)",
     r"\bwhere\b.*(class|lab|room)",
-    r"\b(pdc|cn|adbms|toa|aisd|te)\b.*(class|teacher|room|time|when|where)",
     r"\b(teaches?|instructor)\b",
     r"next class",
-    r"(aaj|kal|monday|tuesday|wednesday|thursday|friday).*(class|schedule)",
+    r"(aaj|kal|monday|tuesday|wednesday|thursday|friday).*(class|schedule|lecture|lab)",
 ]
 
 
@@ -231,7 +230,7 @@ def handle_agent_query(db, user_id: str, phone: str, message_text: str, intent: 
         return (
             "Hey! 👋 I'm your *DueMate Assistant*. Here's what you can do:\n\n"
             "📌 *Save tasks* — just forward or type an assignment/quiz announcement\n"
-            "📅 *Ask about your timetable* — e.g. _\"when is PDC class?\"_ or _\"who teaches CN?\"_\n"
+            "📅 *Ask about your timetable* — e.g. _\"when is my next class?\"_ or _\"who teaches my <course>?\"_\n"
             "📋 *Check your tasks* — e.g. _\"what assignments do I have?\"_\n\n"
             "Try sending an assignment announcement to get started!"
         )

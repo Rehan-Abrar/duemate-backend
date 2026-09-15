@@ -110,6 +110,15 @@ def ensure_indexes() -> None:
     # User timetables — one document per user, stores ALL parsed sections
     db.user_timetables.create_index("user_id", unique=True)
 
+    # Official (admin-managed) timetables — versioned central source of truth
+    db.official_timetables.create_index([("timetable_id", 1), ("version", 1)], unique=True)
+    db.official_timetables.create_index(
+        [("status", 1), ("detected_sections", 1), ("effective_from", 1)]
+    )
+    db.official_timetables.create_index([("university_id", 1), ("academic_term", 1)])
+    db.timetable_audit.create_index("at")
+    db.timetable_audit.create_index("timetable_id")
+
     _indexes_ready = True
     logger.info("MongoDB indexes created successfully")
 

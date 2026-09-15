@@ -21,6 +21,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 import jwt
 
 from utils.parse_task import SEMESTER_COURSES, parse_task
+from utils.academic import get_user_academic_context, STATUS_OK
 from utils.fingerprint import make_fingerprint, check_duplicate
 from utils.auth import (
     create_otp,
@@ -416,6 +417,106 @@ def _is_course_unresolved(parsed_course: Optional[str], source_key: str) -> bool
     return False
 
 
+# ── Admin-managed official timetable helpers ────────────────────────────────────
+# See docs/backend-audit-15-09-2026/08-admin-timetable-architecture.md
+
+def _slugify(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(text or "").lower()).strip("-")
+
+
+def _make_timetable_id(university_id: str, academic_term: str) -> str:
+    return f"{_slugify(university_id)}-{_slugify(academic_term)}"
+
+
+def _diff_sections(new_sections: dict, old_sections: dict) -> dict:
+    """Compare two {section: [slots]} maps for the admin review screen."""
+    new_keys = set((new_sections or {}).keys())
+    old_keys = set((old_sections or {}).keys())
+    added = sorted(new_keys - old_keys)
+    removed = sorted(old_keys - new_keys)
+    changed = sorted(
+        k for k in (new_keys & old_keys)
+        if (new_sections or {}).get(k) != (old_sections or {}).get(k)
+    )
+    return {
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "counts": {"added": len(added), "removed": len(removed), "changed": len(changed)},
+    }
+
+
+def _current_published_timetable(db, timetable_id: str) -> Optional[dict]:
+    """Latest published version for a timetable lineage (regardless of effective dates)."""
+    return db.official_timetables.find_one(
+        {"timetable_id": timetable_id, "status": "published"},
+        sort=[("version", -1)],
+    )
+
+
+def _next_timetable_version(db, timetable_id: str) -> int:
+    latest = db.official_timetables.find_one(
+        {"timetable_id": timetable_id}, sort=[("version", -1)], projection={"version": 1}
+    )
+    return int((latest or {}).get("version", 0)) + 1
+
+
+def _log_timetable_audit(db, action: str, doc: dict, actor: str, extra: Optional[dict] = None) -> None:
+    try:
+        entry = {
+            "action": action,
+            "timetable_id": doc.get("timetable_id"),
+            "version": doc.get("version"),
+            "version_id": str(doc.get("_id")) if doc.get("_id") else None,
+            "university_id": doc.get("university_id"),
+            "academic_term": doc.get("academic_term"),
+            "sections_affected": doc.get("detected_sections", []),
+            "actor": actor,
+            "at": _utc_now(),
+        }
+        if extra:
+            entry.update(extra)
+        db.timetable_audit.insert_one(entry)
+    except Exception:
+        pass
+
+
+_SECTION_IDENTITY_RE = re.compile(r"^([A-Za-z]+)[-\s]?(\d+)[-\s]?([A-Za-z])$")
+
+
+def _parse_section_identity(section: str) -> dict:
+    """Derive program + semester from a section label (e.g. BSCS-7B → BSCS, 7)."""
+    match = _SECTION_IDENTITY_RE.match((section or "").strip())
+    if not match:
+        return {"program": None, "semester": None}
+    return {"program": match.group(1).upper(), "semester": int(match.group(2))}
+
+
+def _find_published_official_for_section(
+    db,
+    section: str,
+    university_id: Optional[str] = None,
+    academic_term: Optional[str] = None,
+) -> Optional[dict]:
+    """Currently published + effective official timetable covering `section`."""
+    if not section:
+        return None
+    now = _utc_now()
+    query = {
+        "status": "published",
+        "detected_sections": section,
+        "effective_from": {"$lte": now},
+        "$or": [{"effective_to": None}, {"effective_to": {"$gt": now}}],
+    }
+    if university_id:
+        query["university_id"] = university_id
+    if academic_term:
+        query["academic_term"] = academic_term
+    return db.official_timetables.find_one(
+        query, sort=[("effective_from", -1), ("version", -1)]
+    )
+
+
 def get_env(primary: str, *aliases: str, default: str = "") -> str:
     """Read environment value using a primary key with optional aliases."""
     for key in (primary, *aliases):
@@ -546,6 +647,14 @@ def ensure_mongo_indexes() -> None:
     ensure_conversation_index(db)
     # User timetables — one document per user, stores ALL parsed sections
     db.user_timetables.create_index("user_id", unique=True)
+    # Official (admin-managed) timetables — versioned, section-indexed
+    db.official_timetables.create_index([("timetable_id", 1), ("version", 1)], unique=True)
+    db.official_timetables.create_index(
+        [("status", 1), ("detected_sections", 1), ("effective_from", 1)]
+    )
+    db.official_timetables.create_index([("university_id", 1), ("academic_term", 1)])
+    db.timetable_audit.create_index("at")
+    db.timetable_audit.create_index("timetable_id")
     _indexes_ready = True
 
 
@@ -811,36 +920,81 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     continue
                 # ─────────────────────────────────────────────────────────────
 
-                # ── Agent Intent Classification & Routing ──
-                from utils.agent import classify_intent, handle_agent_query
-                
-                # Check if the message is a task or a conversational query
-                intent = classify_intent(text_body)
-                app.logger.info("checking_intent text=%r intent=%s", text_body, intent)
-                
-                if intent in ("greeting", "query_schedule", "query_tasks"):
-                    app.logger.info("agent_handled_intent intent=%s from=%s message=%s", intent, sender, text_body[:50])
-                    summary["inbound_messages"] += 1
-                    
-                    # Let the agent RAG / DB tools answer the query
-                    agent_reply = handle_agent_query(db, user_id, normalized_sender or sender, text_body, intent)
-                    
+                # ── Agent / NLU Intent Classification & Routing ───────────────
+                if os.getenv("NLU_LLM_ROUTING_ENABLED", "false").lower() in ("1", "true", "yes"):
+                    # ── NLU path (LLM #1 → backend → optional LLM #2) ────────
+                    from utils.nlu import handle_message as _nlu_handle  # type: ignore
                     try:
-                        send_text_message(
-                            to_number=normalized_sender or sender,
-                            message_body=agent_reply,
-                            preview_url=False
+                        _nlu_result = _nlu_handle(
+                            db, user_id, normalized_sender or sender, text_body
                         )
-                    except Exception as e:
-                        app.logger.warning("agent_reply_failed from=%s error=%s", sender, str(e))
-                    
-                    # Don't create a task, skip to next message
-                    continue
-                
-                app.logger.info("intent_save_task_proceeding_to_parse text=%s", repr(text_body))
+                    except Exception as _nlu_err:
+                        app.logger.warning(
+                            "nlu_handle_error fallback to legacy err=%s", _nlu_err
+                        )
+                        _nlu_result = {"action": "save_task"}
+
+                    if _nlu_result["action"] == "reply":
+                        summary["inbound_messages"] += 1
+                        app.logger.info(
+                            "nlu_handled from=%s text=%r", sender, text_body[:50]
+                        )
+                        try:
+                            send_text_message(
+                                to_number=normalized_sender or sender,
+                                message_body=_nlu_result["text"],
+                                preview_url=False,
+                            )
+                        except Exception as _send_err:
+                            app.logger.warning(
+                                "nlu_reply_send_failed from=%s error=%s", sender, _send_err
+                            )
+                        continue  # don't save_task
+                    # action == "save_task" → fall through to parse_task below
+                    app.logger.info(
+                        "nlu_save_task_proceeding text=%r", text_body[:50]
+                    )
+                else:
+                    # ── Legacy path: keyword + Groq intent classifier ─────────
+                    from utils.agent import classify_intent, handle_agent_query
+                    intent = classify_intent(text_body)
+                    app.logger.info(
+                        "checking_intent text=%r intent=%s", text_body, intent
+                    )
+
+                    if intent in ("greeting", "query_schedule", "query_tasks"):
+                        app.logger.info(
+                            "agent_handled_intent intent=%s from=%s message=%s",
+                            intent, sender, text_body[:50],
+                        )
+                        summary["inbound_messages"] += 1
+                        agent_reply = handle_agent_query(
+                            db, user_id, normalized_sender or sender, text_body, intent
+                        )
+                        try:
+                            send_text_message(
+                                to_number=normalized_sender or sender,
+                                message_body=agent_reply,
+                                preview_url=False,
+                            )
+                        except Exception as e:
+                            app.logger.warning(
+                                "agent_reply_failed from=%s error=%s", sender, str(e)
+                            )
+                        continue
+
+                    app.logger.info(
+                        "intent_save_task_proceeding_to_parse text=%s", repr(text_body)
+                    )
 
                 mapped_course = _resolve_course_from_mapping(db, user_id, source_key) if user_id else None
-                parse_result = parse_task(text_body, course_hint=mapped_course)
+                _ctx = get_user_academic_context(db, user_id) if user_id else {}
+                parse_result = parse_task(
+                    text_body,
+                    course_hint=mapped_course,
+                    user_courses=_ctx.get("courses"),
+                    overrides=_ctx.get("aliases"),
+                )
                 task_status = "needs_review" if parse_result["needs_review"] else "pending"
                 course_unresolved = _is_course_unresolved(parse_result.get("course"), source_key)
                 course_resolution_method = "mapped" if mapped_course else ("heuristic" if parse_result.get("course") else "unresolved")
@@ -1446,9 +1600,15 @@ def create_app() -> Flask:
             user_id = user.get("user_id")
             source_key = "web_extract"
             mapped_course = _resolve_course_from_mapping(db, user_id, source_key) if user_id else None
-            
-            parse_result = parse_task(message_body, course_hint=mapped_course)
-            
+
+            _ctx = get_user_academic_context(db, user_id) if user_id else {}
+            parse_result = parse_task(
+                message_body,
+                course_hint=mapped_course,
+                user_courses=_ctx.get("courses"),
+                overrides=_ctx.get("aliases"),
+            )
+
             task_status = "needs_review" if parse_result["needs_review"] else "pending"
             course_unresolved = _is_course_unresolved(parse_result.get("course"), source_key)
             course_resolution_method = "mapped" if mapped_course else ("heuristic" if parse_result.get("course") else "unresolved")
@@ -2001,7 +2161,24 @@ def create_app() -> Flask:
 
     @app.get("/api/courses/default")
     def default_courses():
-        return jsonify({"items": SEMESTER_COURSES, "count": len(SEMESTER_COURSES)})
+        """Return the authenticated user's ACTUAL courses (from their applicable
+        timetable). No hardcoded course list is served for real users."""
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        ctx = get_user_academic_context(db, user.get("user_id"))
+        courses = ctx.get("courses", [])
+        return jsonify({
+            "items": courses,
+            "count": len(courses),
+            "source": ctx.get("source"),
+            "status": ctx.get("status"),
+        })
 
     @app.patch("/api/tasks/<task_id>/status")
     def update_task_status(task_id: str):
@@ -2346,7 +2523,12 @@ def create_app() -> Flask:
     def select_student_timetable_section():
         """
         Set the user's active timetable section.
-        No re-upload required — all sections are already stored from the last upload.
+
+        Official path: if a published official timetable covers the section and the
+        student is (or is becoming) university-associated, update settings only.
+        No user_timetables document is required or written.
+
+        Self-upload fallback: unchanged — requires a previously uploaded PDF.
         """
         db = get_mongo_db()
         if db is None:
@@ -2362,6 +2544,54 @@ def create_app() -> Flask:
 
         if not section:
             return jsonify({"error": "section_required"}), 400
+
+        settings = user.get("settings") or {}
+        body_university = str(data.get("university_id") or "").strip()
+        body_term = str(data.get("academic_term") or "").strip()
+        university_id = body_university or str(settings.get("university_id") or "").strip()
+        academic_term = body_term or str(settings.get("academic_term") or "").strip() or None
+
+        # Official path only when we can bind the student to a university — either
+        # they already have one, or the official picker sent it. Classic self-upload
+        # clients that only send {section} keep the PDF path even if an official
+        # timetable happens to list the same section label.
+        official = None
+        if university_id:
+            official = _find_published_official_for_section(
+                db, section, university_id=university_id, academic_term=academic_term
+            )
+            if official is None and academic_term:
+                official = _find_published_official_for_section(
+                    db, section, university_id=university_id
+                )
+
+        if official is not None:
+            slots = (official.get("sections") or {}).get(section, [])
+            identity = _parse_section_identity(section)
+            resolved_uni = official.get("university_id") or university_id
+            resolved_term = official.get("academic_term") or academic_term
+            db.users.update_one(
+                {"user_id": user_id},
+                {"$set": {
+                    "settings.timetable_section": section,
+                    "settings.university_id": resolved_uni,
+                    "settings.academic_term": resolved_term,
+                    "settings.program": identity.get("program"),
+                    "settings.semester": identity.get("semester"),
+                    "updated_at": _utc_now(),
+                }},
+            )
+            app.logger.info(
+                "timetable_select_official: user=%s section=%s slots=%d uni=%s term=%s",
+                user_id, section, len(slots), resolved_uni, resolved_term,
+            )
+            return jsonify({
+                "section": section,
+                "slots": len(slots),
+                "source": "official",
+                "university_id": resolved_uni,
+                "academic_term": resolved_term,
+            }), 200
 
         doc = db.user_timetables.find_one({"user_id": user_id})
         if not doc:
@@ -2395,7 +2625,7 @@ def create_app() -> Flask:
         )
 
         app.logger.info("timetable_select: user=%s section=%s slots=%d", user_id, section, slot_count)
-        return jsonify({"section": section, "slots": slot_count}), 200
+        return jsonify({"section": section, "slots": slot_count, "source": "self_upload"}), 200
 
     @app.get("/api/student/timetable")
     def get_student_timetable():
@@ -2414,25 +2644,27 @@ def create_app() -> Flask:
 
         user_id = user.get("user_id")
 
-        doc = db.user_timetables.find_one({"user_id": user_id})
-        if not doc or not doc.get("selected_section"):
+        # Resolve via the shared academic context so students on an OFFICIAL
+        # (admin-published) timetable see it even without a self-uploaded PDF.
+        ctx = get_user_academic_context(db, user_id)
+        if ctx["status"] != STATUS_OK:
             return jsonify([]), 200
 
-        section = doc["selected_section"]
-        raw_slots = doc.get("sections", {}).get(section, [])
+        section = ctx["section"]
 
         # Rename 'instructor' → 'teacher' for frontend type compatibility
         # (TimetableSlot uses slot.teacher, not slot.instructor)
         slots = []
-        for s in raw_slots:
-            slots.append({
-                "day": s.get("day", ""),
-                "time": s.get("time", ""),
-                "course": s.get("course", ""),
-                "room": s.get("room", ""),
-                "teacher": s.get("instructor", ""),
-                "section": s.get("section", section),
-            })
+        for day_slots in ctx["schedule"].values():
+            for s in day_slots:
+                slots.append({
+                    "day": s.get("day", ""),
+                    "time": s.get("time", ""),
+                    "course": s.get("course", ""),
+                    "room": s.get("room", ""),
+                    "teacher": s.get("instructor", ""),
+                    "section": s.get("section", section),
+                })
 
         return jsonify(slots), 200
 
@@ -2452,12 +2684,13 @@ def create_app() -> Flask:
 
         user_id = user.get("user_id")
 
-        doc = db.user_timetables.find_one({"user_id": user_id})
-        if not doc or not doc.get("selected_section"):
+        # Official-first resolution (same as GET /api/student/timetable).
+        ctx = get_user_academic_context(db, user_id)
+        if ctx["status"] != STATUS_OK:
             return jsonify({"error": "no_timetable"}), 404
 
-        section = doc["selected_section"]
-        raw_slots = doc.get("sections", {}).get(section, [])
+        section = ctx["section"]
+        raw_slots = [s for day_slots in ctx["schedule"].values() for s in day_slots]
 
         if not raw_slots:
             return jsonify({"error": "no_slots"}), 404
@@ -2477,6 +2710,348 @@ def create_app() -> Flask:
             },
         )
 
+    # ══════════════════════════════════════════════════════════════════════
+    # Admin-managed official timetable (versioned, draft → review → publish)
+    # See docs/backend-audit-15-09-2026/08-admin-timetable-architecture.md
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _parse_iso_utc(value) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+    @app.post("/api/admin/timetable/upload")
+    @admin_auth_required
+    def admin_timetable_upload():
+        """Admin uploads an official timetable PDF. Parses + validates and stores a
+        DRAFT version. Does NOT publish — publishing is a separate, explicit step."""
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        actor = g.user.get("user_id")
+
+        university_id = str(request.form.get("university_id", "")).strip()
+        academic_term = str(request.form.get("academic_term", "")).strip()
+        if not university_id or not academic_term:
+            return jsonify({
+                "error": "missing_fields",
+                "detail": "university_id and academic_term form fields are required."
+            }), 400
+
+        if "file" not in request.files:
+            return jsonify({"error": "no_file", "detail": "No file field in request."}), 400
+        pdf_file = request.files["file"]
+        if pdf_file.filename == "":
+            return jsonify({"error": "no_file", "detail": "No file selected."}), 400
+
+        pdf_bytes = pdf_file.read()
+        if len(pdf_bytes) > 20 * 1024 * 1024:
+            return jsonify({"error": "file_too_large", "detail": "Maximum PDF size is 20 MB."}), 413
+        if len(pdf_bytes) == 0:
+            return jsonify({"error": "empty_file", "detail": "Uploaded file is empty."}), 400
+
+        try:
+            from utils.timetable_universal import UniversalTimetableParser
+            parser = UniversalTimetableParser(stream=pdf_bytes)
+        except Exception as exc:
+            app.logger.warning("admin_timetable_upload: open failed actor=%s error=%s", actor, exc)
+            return jsonify({"error": "invalid_pdf", "detail": "The file could not be opened as a PDF."}), 400
+
+        if not parser.validate_layout():
+            return jsonify({
+                "error": "unsupported_layout",
+                "detail": "This PDF does not match a supported grid-format timetable layout."
+            }), 422
+
+        try:
+            parsed_all = parser.parse_all()
+        except Exception as exc:
+            app.logger.exception("admin_timetable_upload: parse_all failed actor=%s error=%s", actor, exc)
+            return jsonify({"error": "parse_failed", "detail": str(exc)}), 500
+
+        if not parsed_all:
+            return jsonify({"error": "no_sections_found", "detail": "No sections detected in this PDF."}), 422
+
+        detected = sorted(parsed_all.keys())
+        timetable_id = _make_timetable_id(university_id, academic_term)
+        version = _next_timetable_version(db, timetable_id)
+
+        draft = {
+            "timetable_id": timetable_id,
+            "university_id": university_id,
+            "academic_term": academic_term,
+            "version": version,
+            "status": "draft",
+            "uploaded_by": actor,
+            "uploaded_at": _utc_now(),
+            "published_at": None,
+            "published_by": None,
+            "effective_from": None,
+            "effective_to": None,
+            "source": {
+                "filename": pdf_file.filename or "timetable.pdf",
+                "size": len(pdf_bytes),
+                "sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+            },
+            "sections": parsed_all,
+            "detected_sections": detected,
+        }
+        result = db.official_timetables.insert_one(draft)
+        draft["_id"] = result.inserted_id
+
+        current = _current_published_timetable(db, timetable_id)
+        diff = _diff_sections(parsed_all, (current or {}).get("sections", {}))
+        _log_timetable_audit(db, "upload", draft, actor)
+
+        app.logger.info("admin_timetable_upload: draft created id=%s ver=%s sections=%s",
+                        result.inserted_id, version, detected)
+        return jsonify({
+            "version_id": str(result.inserted_id),
+            "timetable_id": timetable_id,
+            "version": version,
+            "status": "draft",
+            "detected_sections": detected,
+            "diff": diff,
+        }), 201
+
+    @app.get("/api/admin/timetable/versions")
+    @admin_auth_required
+    def admin_timetable_versions():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        query = {}
+        timetable_id = request.args.get("timetable_id", "").strip()
+        if timetable_id:
+            query["timetable_id"] = timetable_id
+        items = []
+        for d in db.official_timetables.find(query).sort([("timetable_id", 1), ("version", -1)]):
+            items.append({
+                "version_id": str(d["_id"]),
+                "timetable_id": d.get("timetable_id"),
+                "university_id": d.get("university_id"),
+                "academic_term": d.get("academic_term"),
+                "version": d.get("version"),
+                "status": d.get("status"),
+                "effective_from": _serialize_for_json(d.get("effective_from")),
+                "effective_to": _serialize_for_json(d.get("effective_to")),
+                "detected_sections": d.get("detected_sections", []),
+                "uploaded_at": _serialize_for_json(d.get("uploaded_at")),
+                "uploaded_by": d.get("uploaded_by"),
+            })
+        return jsonify({"items": items, "count": len(items)})
+
+    @app.get("/api/admin/timetable/<version_id>/review")
+    @admin_auth_required
+    def admin_timetable_review(version_id):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        oid = _parse_object_id(version_id)
+        if oid is None:
+            return jsonify({"error": "invalid_id"}), 400
+        doc = db.official_timetables.find_one({"_id": oid})
+        if not doc:
+            return jsonify({"error": "not_found"}), 404
+
+        current = _current_published_timetable(db, doc.get("timetable_id"))
+        baseline = (current or {}).get("sections", {}) if current and current["_id"] != oid else {}
+        diff = _diff_sections(doc.get("sections", {}), baseline)
+        return jsonify({
+            "version_id": str(oid),
+            "timetable_id": doc.get("timetable_id"),
+            "version": doc.get("version"),
+            "status": doc.get("status"),
+            "detected_sections": doc.get("detected_sections", []),
+            "diff": diff,
+            "slot_counts": {s: len(v) for s, v in (doc.get("sections") or {}).items()},
+        })
+
+    @app.post("/api/admin/timetable/<version_id>/publish")
+    @admin_auth_required
+    def admin_timetable_publish(version_id):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        actor = g.user.get("user_id")
+        oid = _parse_object_id(version_id)
+        if oid is None:
+            return jsonify({"error": "invalid_id"}), 400
+        doc = db.official_timetables.find_one({"_id": oid})
+        if not doc:
+            return jsonify({"error": "not_found"}), 404
+        if doc.get("status") == "published":
+            return jsonify({"error": "already_published"}), 409
+
+        # Validation gate — refuse to publish corrupted/empty parses.
+        if not doc.get("detected_sections") or not doc.get("sections"):
+            return jsonify({
+                "error": "parse_invalid",
+                "detail": "This version has no detected sections; refusing to publish."
+            }), 422
+
+        body = request.get_json(silent=True) or {}
+        effective_from = _parse_iso_utc(body.get("effective_from")) or _utc_now()
+
+        # Bound previously-published versions of the same lineage so only one is
+        # effective at any instant (future-dated publishes stay scheduled).
+        db.official_timetables.update_many(
+            {
+                "timetable_id": doc["timetable_id"],
+                "status": "published",
+                "_id": {"$ne": oid},
+                "$or": [{"effective_to": None}, {"effective_to": {"$gt": effective_from}}],
+            },
+            {"$set": {"effective_to": effective_from}},
+        )
+        db.official_timetables.update_one(
+            {"_id": oid},
+            {"$set": {
+                "status": "published",
+                "published_at": _utc_now(),
+                "published_by": actor,
+                "effective_from": effective_from,
+                "effective_to": None,
+            }},
+        )
+        doc = db.official_timetables.find_one({"_id": oid})
+        _log_timetable_audit(db, "publish", doc, actor,
+                             {"effective_from": _serialize_for_json(effective_from)})
+        return jsonify({
+            "version_id": str(oid),
+            "timetable_id": doc.get("timetable_id"),
+            "version": doc.get("version"),
+            "status": "published",
+            "effective_from": _serialize_for_json(effective_from),
+        })
+
+    @app.post("/api/admin/timetable/<version_id>/rollback")
+    @admin_auth_required
+    def admin_timetable_rollback(version_id):
+        """Re-publish a prior version as the active one (effective now)."""
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        actor = g.user.get("user_id")
+        oid = _parse_object_id(version_id)
+        if oid is None:
+            return jsonify({"error": "invalid_id"}), 400
+        doc = db.official_timetables.find_one({"_id": oid})
+        if not doc:
+            return jsonify({"error": "not_found"}), 404
+        if not doc.get("sections"):
+            return jsonify({"error": "parse_invalid", "detail": "Target version has no data."}), 422
+
+        now = _utc_now()
+        db.official_timetables.update_many(
+            {
+                "timetable_id": doc["timetable_id"],
+                "status": "published",
+                "_id": {"$ne": oid},
+                "$or": [{"effective_to": None}, {"effective_to": {"$gt": now}}],
+            },
+            {"$set": {"effective_to": now}},
+        )
+        db.official_timetables.update_one(
+            {"_id": oid},
+            {"$set": {
+                "status": "published",
+                "published_at": now,
+                "published_by": actor,
+                "effective_from": now,
+                "effective_to": None,
+            }},
+        )
+        doc = db.official_timetables.find_one({"_id": oid})
+        _log_timetable_audit(db, "rollback", doc, actor)
+        return jsonify({
+            "version_id": str(oid),
+            "timetable_id": doc.get("timetable_id"),
+            "version": doc.get("version"),
+            "status": "published",
+            "effective_from": _serialize_for_json(now),
+        })
+
+    # ── Student onboarding: discover official timetable options ──────────────
+    @app.get("/api/timetable/options")
+    def timetable_options():
+        """Universities / terms / sections available from published official timetables."""
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        now = _utc_now()
+        query = {
+            "status": "published",
+            "effective_from": {"$lte": now},
+            "$or": [{"effective_to": None}, {"effective_to": {"$gt": now}}],
+        }
+        universities: dict = {}
+        for d in db.official_timetables.find(query):
+            uni = d.get("university_id")
+            term = d.get("academic_term")
+            u = universities.setdefault(uni, {})
+            secs = u.setdefault(term, set())
+            secs.update(d.get("detected_sections", []))
+
+        items = [
+            {
+                "university_id": uni,
+                "terms": [
+                    {"academic_term": term, "sections": sorted(secs)}
+                    for term, secs in terms.items()
+                ],
+            }
+            for uni, terms in universities.items()
+        ]
+        return jsonify({"items": items, "count": len(items)})
+
+    @app.get("/api/timetable/available")
+    def timetable_available():
+        """Whether a published+effective official timetable covers a given section."""
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        user, _, auth_error = resolve_authenticated_user_or_401(db)
+        if auth_error:
+            return auth_error
+
+        section = request.args.get("section", "").strip()
+        if not section:
+            return jsonify({"error": "section_required"}), 400
+        university_id = request.args.get("university_id", "").strip()
+        term = request.args.get("term", "").strip()
+
+        now = _utc_now()
+        query = {
+            "status": "published",
+            "detected_sections": section,
+            "effective_from": {"$lte": now},
+            "$or": [{"effective_to": None}, {"effective_to": {"$gt": now}}],
+        }
+        if university_id:
+            query["university_id"] = university_id
+        if term:
+            query["academic_term"] = term
+
+        doc = db.official_timetables.find_one(query, sort=[("effective_from", -1), ("version", -1)])
+        if not doc:
+            return jsonify({"available": False})
+        return jsonify({
+            "available": True,
+            "timetable_id": doc.get("timetable_id"),
+            "version": doc.get("version"),
+            "university_id": doc.get("university_id"),
+            "academic_term": doc.get("academic_term"),
+        })
+
     @app.post("/api/student/assistant/chat")
     def assistant_chat():
         db = get_mongo_db()
@@ -2492,6 +3067,22 @@ def create_app() -> Flask:
         if not message:
             return jsonify({"error": "message_required"}), 400
 
+        if os.getenv("NLU_LLM_ROUTING_ENABLED", "false").lower() in ("1", "true", "yes"):
+            from utils.nlu import handle_message as _nlu_handle  # type: ignore
+            try:
+                _nlu_result = _nlu_handle(
+                    db,
+                    user.get("user_id"),
+                    user.get("phone_number"),
+                    message,
+                )
+                if _nlu_result["action"] == "reply":
+                    return jsonify({"reply": _nlu_result["text"], "intent": "nlu"})
+                # save_task from dashboard chat → fall through to legacy path
+            except Exception as _nlu_err:
+                app.logger.warning("assistant_chat nlu_failed err=%s", _nlu_err)
+                # fall through on error
+
         from utils.agent import classify_intent, handle_agent_query
         intent = classify_intent(message)
         reply = handle_agent_query(
@@ -2499,11 +3090,11 @@ def create_app() -> Flask:
             user.get("user_id"),
             user.get("phone_number"),
             message,
-            intent
+            intent,
         )
         return jsonify({
             "reply": reply,
-            "intent": intent
+            "intent": intent,
         })
 
     @app.get("/webhook")

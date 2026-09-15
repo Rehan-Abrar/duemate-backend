@@ -144,6 +144,36 @@ class TestRealWorldStudentMessages:
         assert "3" in result["title"]
 
 
+class TestDynamicCourseMatching:
+    """Course detection/reconciliation uses the caller's ACTUAL courses when provided,
+    and falls back to the legacy alias table only when no user courses are given."""
+
+    def test_user_courses_resolve_non_bscs6_course(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        courses = ["Operating Systems", "Software Engineering", "Linear Algebra"]
+        result = parse_task("submit OS assignment friday", user_courses=courses)
+        assert result["course"] == "Operating Systems"
+
+    def test_user_courses_token_overlap(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        courses = ["Operating Systems", "Software Engineering"]
+        result = parse_task("software engineering assignment due friday", user_courses=courses)
+        assert result["course"] == "Software Engineering"
+
+    def test_per_user_override(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        courses = ["Operating Systems"]
+        overrides = {"sysprog": "Operating Systems"}
+        result = parse_task("sysprog homework friday", user_courses=courses, overrides=overrides)
+        assert result["course"] == "Operating Systems"
+
+    def test_no_user_courses_uses_legacy_fallback(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        # Backward compatible: without user_courses, PDC still resolves via alias table
+        result = parse_task("PDC assignment friday")
+        assert result["course"] == "Parallel & Distributed Computing"
+
+
 class TestTimeParsing:
     """Verify explicit times in messages override defaults."""
 

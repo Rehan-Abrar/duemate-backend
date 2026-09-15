@@ -380,11 +380,13 @@ def _extract_deterministic_fields(
     message_text: str,
     course_hint: Optional[str] = None,
     now: Optional[datetime] = None,
+    user_courses: Optional[list] = None,
+    overrides: Optional[dict] = None,
 ) -> dict:
     now = now or _utc_now()
     normalized = _normalize(message_text)
     task_type = detect_task_type(normalized)
-    course = detect_course(normalized)
+    course = detect_course(normalized, user_courses=user_courses, overrides=overrides)
     if course_hint and not course:
         hinted = _normalize_course_value(course_hint.strip())
         if hinted:
@@ -458,9 +460,25 @@ def _reconcile_title(
 def _reconcile_course(
     groq_course: Optional[str],
     det_course: Optional[str],
+    user_courses: Optional[list] = None,
+    overrides: Optional[dict] = None,
 ) -> Optional[str]:
+    # Dynamic gate: accept the LLM's course if it matches ANY of the user's real
+    # courses (not just the legacy hardcoded SEMESTER_COURSES list).
+    if user_courses:
+        try:
+            from utils.academic import match_course
+            for candidate in (groq_course, det_course):
+                if candidate:
+                    matched = match_course(str(candidate), user_courses, overrides or {})
+                    if matched:
+                        return matched
+        except Exception:
+            pass
+
     groq_norm = _normalize_course_value(groq_course)
     det_norm = _normalize_course_value(det_course) if det_course else None
+    # Legacy fallback gate (only meaningful when there is no user timetable context).
     if groq_norm and groq_norm in SEMESTER_COURSES:
         return groq_norm
     if det_norm:
@@ -535,8 +553,24 @@ def detect_task_type(text: str) -> str:
     return "assignment"
 
 
-def detect_course(text: str) -> Optional[str]:
+def detect_course(
+    text: str,
+    user_courses: Optional[list] = None,
+    overrides: Optional[dict] = None,
+) -> Optional[str]:
     lower = text.lower()
+
+    # Dynamic first: match against the user's ACTUAL courses when available.
+    if user_courses:
+        try:
+            from utils.academic import match_course
+            dynamic = match_course(text, user_courses, overrides or {})
+            if dynamic:
+                return dynamic
+        except Exception:
+            pass
+
+    # Fallback (only when no user timetable context): legacy alias table.
     for alias, canonical in COURSE_ALIASES.items():
         if re.search(rf"\b{re.escape(alias)}\b", lower):
             if alias == "networks" and "neural networks" in lower:
@@ -781,6 +815,8 @@ def _merge_parse_results(
     groq_result: Optional[dict],
     message_text: str,
     parse_method: str,
+    user_courses: Optional[list] = None,
+    overrides: Optional[dict] = None,
 ) -> dict:
     now = _utc_now()
     text = deterministic.get("normalized_text") or _normalize(message_text)
@@ -819,7 +855,9 @@ def _merge_parse_results(
         now,
     )
     title = _reconcile_title(groq_title, deterministic.get("title"), text)
-    course = _reconcile_course(groq_course, deterministic.get("course"))
+    course = _reconcile_course(
+        groq_course, deterministic.get("course"), user_courses=user_courses, overrides=overrides
+    )
 
     confidence = _compute_parse_confidence(
         task_type,
@@ -1003,25 +1041,48 @@ def _parse_with_groq(
         raise
 
 
-def _parse_with_regex_fallback(message_text: str, course_hint: Optional[str] = None) -> dict:
+def _parse_with_regex_fallback(
+    message_text: str,
+    course_hint: Optional[str] = None,
+    user_courses: Optional[list] = None,
+    overrides: Optional[dict] = None,
+) -> dict:
     """
     Fallback parser using regex and dateparser.
 
     Used when Groq API is unavailable, rate-limited, or returns errors.
     """
-    deterministic = _extract_deterministic_fields(message_text, course_hint)
-    return _merge_parse_results(deterministic, None, message_text, "regex_fallback")
+    deterministic = _extract_deterministic_fields(
+        message_text, course_hint, user_courses=user_courses, overrides=overrides
+    )
+    return _merge_parse_results(
+        deterministic, None, message_text, "regex_fallback",
+        user_courses=user_courses, overrides=overrides,
+    )
 
 
-def parse_task(message_text: str, course_hint: Optional[str] = None, db=None) -> dict:
+def parse_task(
+    message_text: str,
+    course_hint: Optional[str] = None,
+    db=None,
+    user_courses: Optional[list] = None,
+    overrides: Optional[dict] = None,
+) -> dict:
     """
     Parse WhatsApp message into structured task details.
 
     Always runs deterministic extraction, optionally enriches with Groq, and
     reconciles both so dates/titles cannot silently drift.
+
+    When `user_courses` is provided (the caller's real timetable courses), course
+    detection/reconciliation matches against those dynamically. When omitted (e.g.
+    the user has no timetable yet), it falls back to the legacy alias table so
+    behavior is unchanged for existing callers/tests.
     """
     now = _utc_now()
-    deterministic = _extract_deterministic_fields(message_text, course_hint, now)
+    deterministic = _extract_deterministic_fields(
+        message_text, course_hint, now, user_courses=user_courses, overrides=overrides
+    )
 
     groq_result = None
     parse_method = "regex_fallback"
@@ -1040,7 +1101,10 @@ def parse_task(message_text: str, course_hint: Optional[str] = None, db=None) ->
     except Exception as e:
         logger.warning("Groq parser failed: %s — using deterministic extraction", e)
 
-    result = _merge_parse_results(deterministic, groq_result, message_text, parse_method)
+    result = _merge_parse_results(
+        deterministic, groq_result, message_text, parse_method,
+        user_courses=user_courses, overrides=overrides,
+    )
     logger.info(
         "Parse complete method=%s confidence=%.2f due=%s title=%r",
         result.get("parse_method"),

@@ -26,17 +26,37 @@ STATE_AWAITING_DATE = "awaiting_date"
 
 CANCEL_TOKENS = {"cancel", "stop", "nevermind", "never mind", "quit", "exit", "skip", "done"}
 
+# Last-resort menu used only when the user has no resolvable timetable courses.
+# The real menu is built dynamically from the user's actual courses.
 COURSE_MENU = (
     "Which course is this for?\n\n"
-    "📚 Your courses:\n"
-    "• *AI-Driven Software Development* (aisd)\n"
-    "• *Parallel & Distributed Computing* (pdc)\n"
-    "• *Technology Entrepreneurship* (te)\n"
-    "• *Computer Networks* (cn)\n"
-    "• *Advanced DBMS* (adbms)\n"
-    "• *Theory of Automata* (toa)\n\n"
+    "Please reply with the course name.\n\n"
     "_(Reply 'cancel' to skip)_"
 )
+
+
+def build_course_menu(courses: Optional[list]) -> str:
+    """Build the 'which course?' prompt from the user's ACTUAL courses."""
+    if not courses:
+        return COURSE_MENU
+    lines = "\n".join(f"• *{c}*" for c in courses)
+    return (
+        "Which course is this for?\n\n"
+        "📚 Your courses:\n"
+        f"{lines}\n\n"
+        "_(Reply 'cancel' to skip)_"
+    )
+
+
+def _user_courses(db, user_id: Optional[str]) -> list:
+    """Fetch the user's real courses via the shared academic context."""
+    if db is None or not user_id:
+        return []
+    try:
+        from utils.academic import get_user_academic_context
+        return get_user_academic_context(db, user_id).get("courses", []) or []
+    except Exception:
+        return []
 
 DATE_PROMPT = (
     "When is it due? You can say:\n"
@@ -57,8 +77,9 @@ def _expire_at() -> datetime:
     return _utc_now() + timedelta(minutes=CONVERSATION_TTL_MINUTES)
 
 
-def _resolve_course(text: str) -> Optional[str]:
-    """Try to match free text to a canonical semester course."""
+def _resolve_course(text: str, db=None, user_id: Optional[str] = None) -> Optional[str]:
+    """Match a free-text reply to one of the user's ACTUAL courses (dynamic),
+    falling back to the legacy alias table only when there is no timetable context."""
     # Import here to avoid circular deps at module level
     from utils.parse_task import COURSE_ALIASES, SEMESTER_COURSES, detect_course, _normalize_course_value  # noqa: F401
 
@@ -66,23 +87,39 @@ def _resolve_course(text: str) -> Optional[str]:
     if lower in CANCEL_TOKENS:
         return None
 
-    # Direct alias table match
+    # Dynamic first: match against the user's real courses.
+    courses = _user_courses(db, user_id)
+    if courses:
+        # Exact (case-insensitive) course-name match wins.
+        for c in courses:
+            if lower == c.lower():
+                return c
+        try:
+            from utils.academic import match_course, load_course_overrides
+            overrides = load_course_overrides(db, user_id)
+            matched = match_course(text, courses, overrides)
+            if matched:
+                return matched
+        except Exception:
+            pass
+        # If the user has a timetable but nothing matched, don't guess from the
+        # legacy table — return None so the bot re-asks.
+        return None
+
+    # ── No timetable context: legacy alias fallback ──
     if lower in COURSE_ALIASES:
         return COURSE_ALIASES[lower]
 
-    # Canonical name match (case-insensitive)
     for name in SEMESTER_COURSES:
         if lower == name.lower():
             return name
 
-    # Run the full detect_course heuristic
     found = detect_course(text)
     if found:
         normalized = _normalize_course_value(found)
         if normalized:
             return normalized
 
-    # Fuzzy: does any alias appear inside the reply?
     for alias, canonical in COURSE_ALIASES.items():
         if alias in lower:
             return canonical
@@ -126,7 +163,7 @@ def start_conversation(
 
     if missing in ("course", "both"):
         state = STATE_AWAITING_COURSE
-        prompt = COURSE_MENU
+        prompt = build_course_menu(_user_courses(db, user_id))
     else:
         state = STATE_AWAITING_DATE
         prompt = DATE_PROMPT
@@ -171,7 +208,7 @@ def handle_reply(db, conv: dict, reply_text: str) -> dict:
 
     # ── Awaiting course ─────────────────────────────────────────────────────
     if state == STATE_AWAITING_COURSE:
-        course = _resolve_course(reply_clean)
+        course = _resolve_course(reply_clean, db=db, user_id=conv.get("user_id"))
 
         if not course:
             # Extend TTL and ask again
@@ -185,7 +222,7 @@ def handle_reply(db, conv: dict, reply_text: str) -> dict:
                 "updates": {},
                 "prompt": (
                     f"❓ I didn't recognise *{reply_clean[:30]}* as a course.\n\n"
-                    + COURSE_MENU
+                    + build_course_menu(_user_courses(db, conv.get("user_id")))
                 ),
             }
 
