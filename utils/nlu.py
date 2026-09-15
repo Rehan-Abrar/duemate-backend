@@ -12,7 +12,7 @@ Feature flags (env vars, checked at call time so they can flip without redeploy)
   NLU_LLM_ROUTING_ENABLED  (default "false") — enable the LLM #1 path
   NLU_LLM_RESPONSE_ENABLED (default "false") — enable LLM #2 naturalization
   NLU_LLM_TIMEOUT_SECONDS  (default "8")     — per-call timeout
-  GROQ_MODEL               (default "llama-3.3-70b-versatile") — shared model slug
+  GROQ_MODEL               (default "openai/gpt-oss-20b") — shared model slug
 
 The deterministic fallback classifier (_fallback_classify) mirrors the current
 keyword logic in agent.py so behavior is never worse than today when LLM #1 fails.
@@ -30,11 +30,12 @@ from typing import Optional
 
 import requests
 
+from utils.groq_config import GROQ_API_URL, get_groq_model
+
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 _PKT = timezone(timedelta(hours=5))
 
 # Valid values for schema clamping (prevents unconstrained model output from leaking)
@@ -54,7 +55,7 @@ _TIME_RE = re.compile(r"^\d{2}:\d{2}$")
 # ── Config helpers ────────────────────────────────────────────────────────────
 
 def _groq_model() -> str:
-    return os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    return get_groq_model()
 
 def _nlu_timeout() -> float:
     try:

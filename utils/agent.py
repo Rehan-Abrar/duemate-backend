@@ -26,11 +26,10 @@ from typing import Optional
 import requests
 
 from utils.rag import retrieve_schedule_context
+from utils.groq_config import GROQ_API_URL, get_groq_model
 
 logger = logging.getLogger(__name__)
 
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
 _PKT = timezone(timedelta(hours=5))
 
 # ── Deterministic keyword sets ────────────────────────────────────────────────
@@ -138,7 +137,7 @@ def _call_groq(system_prompt: str, user_prompt: str, json_format: bool = False) 
         raise RuntimeError("GROQ_API_KEY not configured")
 
     payload = {
-        "model": GROQ_MODEL,
+        "model": get_groq_model(),
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},

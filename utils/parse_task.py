@@ -1,7 +1,7 @@
 """
 AI-powered task parser for extracting assignment/quiz details from WhatsApp messages.
 
-Primary: Groq API (llama-3.3-70b-versatile) for intelligent parsing
+Primary: Groq API (GROQ_MODEL, default openai/gpt-oss-20b) for intelligent parsing
 Fallback: Regex + dateparser for offline/failure scenarios
 
 The parser handles mixed English/Urdu/Hinglish messages commonly used by
@@ -20,6 +20,8 @@ from typing import Optional
 import dateparser
 from dateparser.search import search_dates
 
+from utils.groq_config import GROQ_API_URL, get_groq_model
+
 try:
     import requests
     HAS_REQUESTS = True
@@ -27,10 +29,6 @@ except ImportError:
     HAS_REQUESTS = False
 
 logger = logging.getLogger(__name__)
-
-# Groq API configuration
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
 
 COURSE_CODE_PATTERN = re.compile(r"\b([A-Z]{2,4}[-\s]?\d{2,4}[A-Z]?)\b", re.IGNORECASE)
 KNOWN_COURSE_TOKENS = {
@@ -932,7 +930,7 @@ def _parse_with_groq(
     system_prompt = _build_groq_system_prompt(today)
 
     payload = {
-        "model": GROQ_MODEL,
+        "model": get_groq_model(),
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"Parse this message:\n\n{message_text}"},
@@ -990,7 +988,7 @@ def _parse_with_groq(
             from utils.llm_logger import log_llm_call
             log_llm_call(
                 db=db,
-                model=GROQ_MODEL,
+                model=get_groq_model(),
                 prompt_version="parse_task_v2",
                 caller="_parse_with_groq",
                 system_prompt=system_prompt,
@@ -1024,7 +1022,7 @@ def _parse_with_groq(
             from utils.llm_logger import log_llm_call
             log_llm_call(
                 db=db,
-                model=GROQ_MODEL,
+                model=get_groq_model(),
                 prompt_version="parse_task_v2",
                 caller="_parse_with_groq",
                 system_prompt=system_prompt,

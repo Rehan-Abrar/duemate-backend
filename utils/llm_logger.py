@@ -7,7 +7,7 @@ cost tracking, and prompt audit purposes.
 Schema of each document:
     {
         "call_id":       str,          # unique UUID
-        "model":         str,          # e.g. "llama-3.3-70b-versatile"
+        "model":         str,          # e.g. "openai/gpt-oss-20b"
         "prompt_version": str,         # e.g. "parse_task_v2"
         "caller":        str,          # which function triggered this call
         "input_tokens":  int,
