@@ -120,6 +120,34 @@ class TestClampRequest:
         assert result["intent"] == "out_of_scope"
         assert result["out_of_scope"]["kind"] is None
 
+    def test_task_action_complete_all_clamped(self):
+        raw = {
+            "intent": "task_action",
+            "language": "en",
+            "confidence": 0.97,
+            "task_action": {"action": "complete", "scope": "all"},
+        }
+        result = _clamp_request(raw)
+        assert result["intent"] == "task_action"
+        assert result["task_action"]["action"] == "complete"
+        assert result["task_action"]["scope"] == "all"
+
+    def test_save_task_draft_clamped(self):
+        raw = {
+            "intent": "save_task",
+            "language": "en",
+            "save_task": {
+                "course": None,
+                "task_type": "quiz",
+                "needs_clarification": True,
+                "missing_fields": ["course", "due_date", "prompt"],
+            },
+        }
+        result = _clamp_request(raw)
+        assert result["save_task"]["task_type"] == "quiz"
+        assert result["save_task"]["needs_clarification"] is True
+        assert result["save_task"]["missing_fields"] == ["course", "due_date"]
+
     def test_out_of_scope_kinds_clamped(self):
         raw = {
             "intent": "out_of_scope",

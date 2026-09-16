@@ -10,7 +10,7 @@ prompt_text: >
 
   SCHEMA:
   {
-    "intent": "schedule_query" | "task_query" | "save_task" | "greeting" | "help" | "out_of_scope",
+    "intent": "schedule_query" | "task_query" | "save_task" | "task_action" | "greeting" | "help" | "out_of_scope",
     "language": "en" | "ur" | "mixed",
     "schedule": {
       "query_type": "next_class" | "day_schedule" | "course_schedule" | "teacher" | "full_timetable" | "free_check",
@@ -25,6 +25,27 @@ prompt_text: >
       "filter_course": "<exact text student wrote> or null",
       "due": "today" | "tomorrow" | "this_week" | "overdue" | null
     },
+    "save_task": {
+      "course": "<exact course text or null>",
+      "task_type": "quiz" | "assignment" | "project" | "exam" | "lab" | "other" | null,
+      "title": "<short title or null>",
+      "due_day": "today" | "tomorrow" | "monday" | "tuesday" | "wednesday" | "thursday" | "friday" | null,
+      "due_time": "HH:MM" | null,
+      "needs_clarification": true,
+      "missing_fields": ["course" | "due_date" | "due_time"],
+      "correction": false
+    },
+    "task_action": {
+      "action": "complete" | "delete" | "reschedule" | "cancel",
+      "scope": "all" | "matching" | "reference",
+      "filter_course": "<exact text or null>",
+      "filter_type": "quiz" | "assignment" | "project" | "exam" | "lab" | "other" | null,
+      "reference": "that" | "it" | "last" | null,
+      "new_due": "today" | "tomorrow" | "monday" | "tuesday" | "wednesday" | "thursday" | "friday" | null,
+      "new_time": "HH:MM" | null,
+      "needs_clarification": false,
+      "missing_fields": ["target"]
+    },
     "out_of_scope": {
       "kind": "casual" | "internal" | "unrelated",
       "topic": "<1-3 word public topic, e.g. weather> | null"
@@ -34,13 +55,23 @@ prompt_text: >
 
   Include "schedule" ONLY when intent == "schedule_query".
   Include "task" ONLY when intent == "task_query".
+  Include "save_task" ONLY when intent == "save_task".
+  Include "task_action" ONLY when intent == "task_action".
   Include "out_of_scope" ONLY when intent == "out_of_scope".
   Omit blocks that are not applicable.
 
+  PENDING CONTEXT (may appear below the message):
+  - Pending_create / Pending_action / Recently_listed_tasks are CONTEXT, not a routing override.
+  - Always classify THIS message for what the student currently wants.
+  - A query, greeting, help request, timetable question, or cancel MUST keep that intent even if a create is pending.
+  - Only treat a short reply as filling the pending create when it is clearly supplying a missing field or correcting one (a course name, a day, a time, "actually it's Computer Vision").
+  - "cancel" / "never mind" with a pending create → task_action action=cancel.
+
   INTENT RULES:
   - schedule_query: asking about CLASS times, rooms, teachers, timetable, or whether they have a class
-  - task_query: asking about their SAVED assignments, quizzes, or deadlines
-  - save_task: ANNOUNCING a new deadline to be recorded (has a specific date/deadline)
+  - task_query: asking about their SAVED assignments, quizzes, or deadlines ("show tasks", "what's due?", "mere tasks")
+  - save_task: CREATING a new assignment/quiz/deadline — including incomplete ones like just "quiz"
+  - task_action: changing existing saved tasks — complete, delete, reschedule, or cancel a pending create
   - greeting: hi/hello/salam/thanks/ok/test
   - help: asking what the bot can do ("what can you do?", "help", "how does this work?")
   - out_of_scope: weather, jokes, praise/slang, system-prompt fishing, general knowledge — anything not timetable or academic tasks
@@ -166,13 +197,46 @@ prompt_text: >
   {"intent":"task_query","language":"en","task":{"filter_course":null,"due":"this_week"},"confidence":0.94}
 
   Message: "PDC assignment due friday"
-  {"intent":"save_task","language":"en","confidence":0.96}
+  {"intent":"save_task","language":"en","save_task":{"course":"PDC","task_type":"assignment","title":null,"due_day":"friday","due_time":null,"needs_clarification":true,"missing_fields":["due_time"],"correction":false},"confidence":0.96}
+
+  Message: "quiz"
+  {"intent":"save_task","language":"en","save_task":{"course":null,"task_type":"quiz","title":null,"due_day":null,"due_time":null,"needs_clarification":true,"missing_fields":["course","due_date","due_time"],"correction":false},"confidence":0.94}
+
+  Message: "Information Security quiz"
+  {"intent":"save_task","language":"en","save_task":{"course":"Information Security","task_type":"quiz","title":null,"due_day":null,"due_time":null,"needs_clarification":true,"missing_fields":["due_date","due_time"],"correction":false},"confidence":0.95}
+
+  Message: "Information Security quiz Monday at 10 AM"
+  {"intent":"save_task","language":"en","save_task":{"course":"Information Security","task_type":"quiz","title":null,"due_day":"monday","due_time":"10:00","needs_clarification":false,"missing_fields":[],"correction":false},"confidence":0.97}
 
   Message: "kal TOA ka quiz hai chapter 3 se"
-  {"intent":"save_task","language":"mixed","confidence":0.97}
+  {"intent":"save_task","language":"mixed","save_task":{"course":"TOA","task_type":"quiz","title":null,"due_day":"tomorrow","due_time":null,"needs_clarification":true,"missing_fields":["due_time"],"correction":false},"confidence":0.97}
 
   Message: "CN project 30 june tak jama karwana hai"
-  {"intent":"save_task","language":"mixed","confidence":0.96}
+  {"intent":"save_task","language":"mixed","save_task":{"course":"CN","task_type":"project","title":null,"due_day":null,"due_time":null,"needs_clarification":true,"missing_fields":["due_time"],"correction":false},"confidence":0.96}
+
+  Message: "mark all my tasks as completed"
+  {"intent":"task_action","language":"en","task_action":{"action":"complete","scope":"all","filter_course":null,"filter_type":null,"reference":null,"new_due":null,"new_time":null,"needs_clarification":false,"missing_fields":[]},"confidence":0.97}
+
+  Message: "complete all my pending tasks"
+  {"intent":"task_action","language":"en","task_action":{"action":"complete","scope":"all","filter_course":null,"filter_type":null,"reference":null,"new_due":null,"new_time":null,"needs_clarification":false,"missing_fields":[]},"confidence":0.96}
+
+  Message: "I've finished everything, mark them done"
+  {"intent":"task_action","language":"en","task_action":{"action":"complete","scope":"all","filter_course":null,"filter_type":null,"reference":null,"new_due":null,"new_time":null,"needs_clarification":false,"missing_fields":[]},"confidence":0.94}
+
+  Message: "mark that done"
+  {"intent":"task_action","language":"en","task_action":{"action":"complete","scope":"reference","filter_course":null,"filter_type":null,"reference":"that","new_due":null,"new_time":null,"needs_clarification":false,"missing_fields":[]},"confidence":0.93}
+
+  Message: "delete my quiz"
+  {"intent":"task_action","language":"en","task_action":{"action":"delete","scope":"matching","filter_course":null,"filter_type":"quiz","reference":null,"new_due":null,"new_time":null,"needs_clarification":false,"missing_fields":[]},"confidence":0.94}
+
+  Message: "move my quiz to Friday"
+  {"intent":"task_action","language":"en","task_action":{"action":"reschedule","scope":"matching","filter_course":null,"filter_type":"quiz","reference":null,"new_due":"friday","new_time":null,"needs_clarification":false,"missing_fields":[]},"confidence":0.93}
+
+  Message: "cancel"
+  {"intent":"task_action","language":"en","task_action":{"action":"cancel","scope":"matching","filter_course":null,"filter_type":null,"reference":null,"new_due":null,"new_time":null,"needs_clarification":false,"missing_fields":[]},"confidence":0.9}
+
+  Message: "show tasks"
+  {"intent":"task_query","language":"en","task":{"filter_course":null,"due":null},"confidence":0.96}
 
   Message: "hi"
   {"intent":"greeting","language":"en","confidence":1.0}

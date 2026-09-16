@@ -38,8 +38,13 @@ _PKT = timezone(timedelta(hours=5))
 
 # Valid values for schema clamping (prevents unconstrained model output from leaking)
 _VALID_INTENTS = frozenset({
-    "schedule_query", "task_query", "save_task", "greeting", "help", "out_of_scope",
+    "schedule_query", "task_query", "save_task", "task_action",
+    "greeting", "help", "out_of_scope",
 })
+_VALID_TASK_TYPES = frozenset({"quiz", "assignment", "project", "exam", "lab", "other"})
+_VALID_TASK_ACTIONS = frozenset({"complete", "delete", "reschedule", "cancel"})
+_VALID_TASK_SCOPE = frozenset({"all", "matching", "reference"})
+_VALID_MISSING = frozenset({"course", "due_date", "due_time", "target"})
 _VALID_QUERY_TYPES = frozenset({
     "next_class", "day_schedule", "course_schedule", "teacher", "full_timetable", "free_check",
 })
@@ -166,7 +171,7 @@ def _call_groq(
         user_content,
         json_mode=json_mode,
         timeout=_nlu_timeout(),
-        max_tokens=400,
+        max_tokens=500,
         db=db,
         caller=caller,
         prompt_version=prompt_version,
@@ -277,6 +282,39 @@ def _clamp_request(raw: dict) -> dict:
             "due": _clamp(task.get("due"), _VALID_DUE, None),
         }
 
+    elif intent == "save_task":
+        draft = raw.get("save_task") or {}
+        missing = draft.get("missing_fields") or []
+        if not isinstance(missing, list):
+            missing = []
+        result["save_task"] = {
+            "course": (draft.get("course") or None),
+            "task_type": _clamp(draft.get("task_type"), _VALID_TASK_TYPES, None),
+            "title": draft.get("title") or None,
+            "due_day": _clamp(str(draft.get("due_day") or "").lower(), _VALID_DAYS, None),
+            "due_time": _validate_time(draft.get("due_time")),
+            "needs_clarification": bool(draft.get("needs_clarification")),
+            "missing_fields": [f for f in missing if f in _VALID_MISSING],
+            "correction": bool(draft.get("correction")),
+        }
+
+    elif intent == "task_action":
+        ta = raw.get("task_action") or {}
+        missing = ta.get("missing_fields") or []
+        if not isinstance(missing, list):
+            missing = []
+        result["task_action"] = {
+            "action": _clamp(ta.get("action"), _VALID_TASK_ACTIONS, None),
+            "scope": _clamp(ta.get("scope"), _VALID_TASK_SCOPE, "matching"),
+            "filter_course": ta.get("filter_course") or None,
+            "filter_type": _clamp(ta.get("filter_type"), _VALID_TASK_TYPES, None),
+            "reference": ta.get("reference") or None,
+            "new_due": _clamp(str(ta.get("new_due") or "").lower(), _VALID_DAYS, None),
+            "new_time": _validate_time(ta.get("new_time")),
+            "needs_clarification": bool(ta.get("needs_clarification")),
+            "missing_fields": [f for f in missing if f in _VALID_MISSING],
+        }
+
     elif intent == "out_of_scope":
         oos = raw.get("out_of_scope") or {}
         result["out_of_scope"] = {
@@ -288,11 +326,14 @@ def _clamp_request(raw: dict) -> dict:
 
 # ── LLM #1: understand ────────────────────────────────────────────────────────
 
-def understand(text: str, db=None) -> dict:
+def understand(text: str, db=None, session: Optional[dict] = None) -> dict:
     """
     Call LLM #1 to parse the student's message into a structured routing request.
     Returns a clamped request dict, or {"intent": "_degraded", ...} on any failure.
     NEVER raises.
+
+    `session` is pending-create / recently-listed context only — the model must
+    not treat it as a routing override.
     """
     system_prompt = _load_prompt("nlu_understand_v1.yaml")
     if not system_prompt:
@@ -302,7 +343,7 @@ def understand(text: str, db=None) -> dict:
     try:
         raw_text = _call_groq(
             system_prompt,
-            f"Message: {text}",
+            _understand_user_content(text, session),
             json_mode=True,
             caller="nlu_understand",
             db=db,
@@ -336,6 +377,30 @@ def understand(text: str, db=None) -> dict:
     except Exception as exc:
         logger.warning("nlu.understand failed (%s), returning degraded", exc)
         return {"intent": "_degraded", "language": "en", "confidence": 0.0}
+
+
+def _understand_user_content(text: str, session: Optional[dict]) -> str:
+    parts = [f"Message: {text}"]
+    session = session or {}
+    pending = session.get("pending_create")
+    if pending:
+        draft = pending.get("draft") or pending
+        parts.append("Pending_create: " + json.dumps({
+            "task_type": draft.get("task_type"),
+            "course": draft.get("course"),
+            "has_due_date": bool(draft.get("due_date")),
+            "has_explicit_time": bool(draft.get("has_explicit_time")),
+        }, ensure_ascii=True))
+    pending_action = session.get("pending_action")
+    if pending_action:
+        parts.append("Pending_action: " + json.dumps({
+            "action": pending_action.get("action"),
+            "candidate_count": len(pending_action.get("candidate_ids") or []),
+        }, ensure_ascii=True))
+    last_labels = session.get("last_task_labels") or []
+    if last_labels:
+        parts.append("Recently_listed_tasks: " + json.dumps(last_labels[:8], ensure_ascii=True))
+    return "\n".join(parts)
 
 # ── Backend execution (pure Python — the only source of facts) ────────────────
 
@@ -473,7 +538,7 @@ def _execute_tasks(request: dict, db, user_id: str) -> dict:
             text = f"No pending tasks for *{raw_course}*! 🎉"
         else:
             text = "You have no pending assignments or quizzes! Great job! 🎉"
-        return {"text": text, "data": {"tasks": []}}
+        return {"text": text, "data": {"tasks": [], "task_ids": [], "task_labels": []}}
 
     task_list = _format_pending_tasks(tasks)
     header = "📋 *Your Pending Tasks:*"
@@ -489,7 +554,26 @@ def _execute_tasks(request: dict, db, user_id: str) -> dict:
         header = "📋 *Overdue Tasks:*"
 
     text = f"{header}\n\n{task_list}\n\nView & edit on your dashboard!"
-    return {"text": text, "data": {"task_count": len(tasks)}}
+    return {
+        "text": text,
+        "data": {
+            "task_count": len(tasks),
+            "task_ids": [str(t.get("_id")) for t in tasks if t.get("_id") is not None],
+            "task_labels": [_format_one_task_label(t) for t in tasks],
+        },
+    }
+
+
+def _format_one_task_label(task: dict) -> str:
+    from utils.parse_task import compose_task_title
+    course = task.get("parsed_course") or "Unknown Course"
+    title = compose_task_title(
+        task.get("parsed_course"),
+        task.get("task_type"),
+        task.get("parsed_title"),
+        task.get("raw_message"),
+    )
+    return f"{course}: {title}"
 
 
 def execute(request: dict, db, user_id: str) -> dict:
@@ -542,6 +626,11 @@ def execute(request: dict, db, user_id: str) -> dict:
             task_result = _execute_tasks(request, db, user_id)
             result["text"] = task_result.get("text", result["text"])
             result["data"] = task_result.get("data")
+            return result
+
+        if intent == "task_action":
+            result["text"] = ""
+            result["data"] = request.get("task_action")
             return result
 
     except Exception as exc:
@@ -605,7 +694,7 @@ def respond(grounded: dict, db=None) -> str:
         return deterministic_text
 
     kind = grounded.get("kind", "")
-    if kind in ("save_task", "_degraded", "out_of_scope", "greeting", "help"):
+    if kind in ("save_task", "task_action", "_degraded", "out_of_scope", "greeting", "help"):
         return deterministic_text  # Static/sentinel — no point rephrasing
 
     if grounded.get("no_timetable"):
@@ -668,40 +757,42 @@ def _fallback_handle(db, user_id: str, phone: str, text: str) -> dict:
         intent = classify_intent(text)
         if intent in ("greeting", "query_schedule", "query_tasks"):
             reply = handle_agent_query(db, user_id, phone, text, intent)
-            return {"action": "reply", "text": reply}
+            return {"action": "reply", "text": reply, "intent": intent}
     except Exception as exc:
         logger.warning("nlu._fallback_handle failed (%s)", exc)
 
     # If we end up here, treat as save_task (preserves current fail-safe behavior)
-    return {"action": "save_task"}
+    return {"action": "save_task", "intent": "save_task"}
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def handle_message(db, user_id: str, phone: str, text: str) -> dict:
     """
-    Main NLU entry point. Called by app.py when NLU_LLM_ROUTING_ENABLED=true.
+    Main NLU entry point for WhatsApp and the web assistant.
 
-    The caller (app.py webhook or assistant_chat) is responsible for:
-      - The active-conversation check (runs before this in the webhook)
-      - Calling send_text_message
-      - Updating summary counters
+    Every message is understood by LLM #1 first. Pending create/action state is
+    passed as context only — it never short-circuits routing.
 
     Returns:
-      {"action": "reply",     "text": str}  — send this reply, skip parse_task
-      {"action": "save_task"}               — fall through to parse_task pipeline
+      {"action": "reply", "text": str, "intent": str}
+      {"action": "save_task", "intent": "save_task"}  — degraded fallback only
 
     Never raises.
     """
     try:
-        # ── Fast path: trivial greetings (skip both LLM calls) ────────────────
-        if _is_trivial_greeting(text):
+        from utils.nlu_session import get_nlu_session, save_nlu_session
+
+        session = get_nlu_session(db, user_id)
+        has_pending = bool(session.get("pending_create") or session.get("pending_action"))
+
+        # Fast-path greetings only when nothing is pending (otherwise "hi" must
+        # still go through LLM #1 so it can be a greeting *or* ignored in context).
+        if _is_trivial_greeting(text) and not has_pending:
             logger.info("nlu: fast_path greeting text=%r", text[:40])
-            return {"action": "reply", "text": GREETING_REPLY}
+            return {"action": "reply", "text": GREETING_REPLY, "intent": "greeting"}
 
-        # ── LLM #1: understand the message ────────────────────────────────────
-        request = understand(text, db=db)
+        request = understand(text, db=db, session=session)
 
-        # Degraded → fall back to the existing keyword classifier
         if request.get("intent") == "_degraded":
             logger.info("nlu: degraded, using fallback classifier text=%r", text[:40])
             return _fallback_handle(db, user_id, phone, text)
@@ -712,21 +803,263 @@ def handle_message(db, user_id: str, phone: str, text: str) -> dict:
             intent, request.get("language", "?"), request.get("confidence", 0), text[:50],
         )
 
-        # save_task → return sentinel so app.py falls through to parse_task
         if intent == "save_task":
-            return {"action": "save_task"}
+            return _handle_save_task(db, user_id, phone, text, request, session)
 
-        # ── Backend: execute against real data ────────────────────────────────
+        if intent == "task_action":
+            return _handle_task_action(db, user_id, phone, text, request, session)
+
         grounded = execute(request, db, user_id)
-
-        # ── LLM #2 (optional): naturalize response ────────────────────────────
         reply_text = respond(grounded, db=db)
 
-        return {"action": "reply", "text": reply_text}
+        if intent == "task_query":
+            data = grounded.get("data") or {}
+            save_nlu_session(
+                db, user_id, phone,
+                last_task_ids=data.get("task_ids") or [],
+                last_task_labels=data.get("task_labels") or [],
+                pending_create=session.get("pending_create"),
+                pending_action=session.get("pending_action"),
+            )
+
+        return {"action": "reply", "text": reply_text, "intent": intent}
 
     except Exception as exc:
-        # Belt-and-suspenders: this should never happen, but if it does we must
-        # not silently drop the message. Return save_task so the message is
-        # at least processed by the parse pipeline rather than lost.
         logger.error("nlu.handle_message unexpected error: %s", exc, exc_info=True)
-        return {"action": "save_task"}
+        return {"action": "save_task", "intent": "save_task"}
+
+
+def _handle_save_task(db, user_id, phone, text, request, session) -> dict:
+    from utils.academic import get_user_academic_context
+    from utils.parse_task import parse_task
+    from utils.nlu_session import save_nlu_session, clear_pending_create
+    from utils.task_actions import (
+        apply_parse_to_draft,
+        missing_create_fields,
+        clarify_create,
+        confirm_create,
+        serialize_draft,
+        deserialize_draft,
+    )
+
+    pending = (session or {}).get("pending_create") or {}
+    draft = deserialize_draft(pending.get("draft") or {})
+    ctx = get_user_academic_context(db, user_id) if db is not None else {}
+    parsed = parse_task(
+        text,
+        course_hint=draft.get("course"),
+        user_courses=ctx.get("courses"),
+        overrides=ctx.get("aliases"),
+    )
+    draft = apply_parse_to_draft(draft, parsed)
+    missing = missing_create_fields(draft)
+    if missing:
+        save_nlu_session(
+            db, user_id, phone,
+            pending_create={"draft": serialize_draft(draft)},
+            pending_action=(session or {}).get("pending_action"),
+            last_task_ids=(session or {}).get("last_task_ids") or [],
+            last_task_labels=(session or {}).get("last_task_labels") or [],
+        )
+        return {
+            "action": "reply",
+            "text": clarify_create(draft, missing[0]),
+            "intent": "save_task",
+        }
+
+    composed = " ".join(
+        p for p in (
+            draft.get("course"),
+            draft.get("task_type") or "task",
+            text,
+        ) if p
+    )
+    persist = _persist_complete_task(db, user_id, phone, composed, draft)
+    if not persist or not persist.get("inserted_task_id"):
+        if persist and persist.get("duplicate_key"):
+            clear_pending_create(db, user_id)
+            return {
+                "action": "reply",
+                "text": "That looks like a task I already have saved.",
+                "intent": "save_task",
+            }
+        return {
+            "action": "reply",
+            "text": "I understood the task but couldn't save it. Please try again.",
+            "intent": "save_task",
+        }
+
+    clear_pending_create(db, user_id)
+    task_doc = persist.get("task_doc") or {}
+    save_nlu_session(
+        db, user_id, phone,
+        pending_create=None,
+        last_task_ids=[persist["inserted_task_id"]],
+        last_task_labels=[f"{task_doc.get('parsed_course')}: {task_doc.get('parsed_title')}"],
+    )
+    return {
+        "action": "reply",
+        "text": confirm_create(task_doc),
+        "intent": "save_task",
+    }
+
+
+def _persist_complete_task(db, user_id, phone, text, draft) -> Optional[dict]:
+    try:
+        from app import persist_inbound_task
+    except Exception:
+        logger.warning("nlu: persist_inbound_task unavailable")
+        return None
+    saved = persist_inbound_task(
+        db,
+        user_id=user_id,
+        phone=phone,
+        text=text,
+        source_key="nlu_create",
+    )
+    # Re-assert grounded draft fields after insert (parse_task may have run again).
+    task_doc = saved.get("task_doc") or {}
+    oid = task_doc.get("_id")
+    if oid is not None and draft.get("course") and db is not None:
+        db.tasks.update_one(
+            {"_id": oid, "user_id": user_id},
+            {"$set": {
+                "parsed_course": draft.get("course") or task_doc.get("parsed_course"),
+                "parsed_due_date": draft.get("due_date") or task_doc.get("parsed_due_date"),
+                "task_type": draft.get("task_type") or task_doc.get("task_type"),
+                "has_explicit_time": True,
+                "needs_review": False,
+                "course_unresolved": False,
+                "status": "pending",
+            }},
+        )
+        saved["task_doc"] = db.tasks.find_one({"_id": oid, "user_id": user_id}) or task_doc
+    return saved
+
+
+def _handle_task_action(db, user_id, phone, text, request, session) -> dict:
+    from utils.nlu_session import save_nlu_session, clear_pending_create, clear_pending_action
+    from utils.task_actions import (
+        resolve_target_tasks,
+        complete_tasks,
+        delete_tasks,
+        reschedule_tasks,
+        confirm_completed,
+        confirm_deleted,
+        confirm_rescheduled,
+        ask_which_task,
+        task_label,
+    )
+    from utils.parse_task import detect_due_date, _utc_now as parse_now
+
+    ta = request.get("task_action") or {}
+    action = ta.get("action")
+    if action == "cancel":
+        clear_pending_create(db, user_id)
+        clear_pending_action(db, user_id)
+        return {"action": "reply", "text": "Okay — I've cancelled that.", "intent": "task_action"}
+
+    if action not in ("complete", "delete", "reschedule"):
+        return {
+            "action": "reply",
+            "text": "I can complete, delete, or reschedule a task — which did you mean?",
+            "intent": "task_action",
+        }
+
+    scope = ta.get("scope") or "matching"
+    if ta.get("reference") in ("that", "it", "last", "this"):
+        scope = "reference"
+
+    last_ids = (session or {}).get("last_task_ids") or []
+    pending_action = (session or {}).get("pending_action") or {}
+    if pending_action.get("candidate_ids") and action == pending_action.get("action"):
+        last_ids = pending_action.get("candidate_ids") or last_ids
+        if scope == "matching" and not ta.get("filter_course") and not ta.get("filter_type"):
+            scope = "reference"
+
+    targets = resolve_target_tasks(
+        db, user_id,
+        scope=scope,
+        filter_type=ta.get("filter_type"),
+        filter_course=ta.get("filter_course"),
+        last_task_ids=last_ids,
+    )
+
+    if not targets:
+        if action == "complete" and scope == "all":
+            return {
+                "action": "reply",
+                "text": "You don't have any pending tasks to complete.",
+                "intent": "task_action",
+            }
+        return {
+            "action": "reply",
+            "text": "I couldn't find a matching pending task. Which one did you mean?",
+            "intent": "task_action",
+        }
+
+    if len(targets) > 1 and scope != "all":
+        save_nlu_session(
+            db, user_id, phone,
+            pending_create=(session or {}).get("pending_create"),
+            pending_action={
+                "action": action,
+                "candidate_ids": [str(t["_id"]) for t in targets],
+            },
+            last_task_ids=[str(t["_id"]) for t in targets],
+            last_task_labels=[task_label(t) for t in targets],
+        )
+        return {
+            "action": "reply",
+            "text": ask_which_task(action, targets),
+            "intent": "task_action",
+        }
+
+    if action == "complete":
+        updated = complete_tasks(db, user_id, targets)
+        clear_pending_action(db, user_id)
+        if not updated:
+            return {
+                "action": "reply",
+                "text": "You don't have any pending tasks to complete.",
+                "intent": "task_action",
+            }
+        return {"action": "reply", "text": confirm_completed(updated), "intent": "task_action"}
+
+    if action == "delete":
+        labels = [task_label(t) for t in targets]
+        count = delete_tasks(db, user_id, targets)
+        clear_pending_action(db, user_id)
+        return {"action": "reply", "text": confirm_deleted(count, labels), "intent": "task_action"}
+
+    due_date = detect_due_date(text, parse_now())
+    if due_date is None:
+        save_nlu_session(
+            db, user_id, phone,
+            pending_create=(session or {}).get("pending_create"),
+            pending_action={
+                "action": "reschedule",
+                "candidate_ids": [str(t["_id"]) for t in targets],
+            },
+            last_task_ids=[str(t["_id"]) for t in targets],
+        )
+        return {
+            "action": "reply",
+            "text": "When should I move it to?",
+            "intent": "task_action",
+        }
+    updated = reschedule_tasks(db, user_id, targets, due_date)
+    clear_pending_action(db, user_id)
+    return {"action": "reply", "text": confirm_rescheduled(updated, due_date), "intent": "task_action"}
+
+
+def dispatch_message(db, user_id: str, phone: str, text: str) -> dict:
+    """
+    Single AI entry point for WhatsApp and the web assistant.
+
+    LLM #1 → execute/RAG → LLM #2 when routing is on; same fallback as WhatsApp
+    when it is off or degraded. Never raises.
+    """
+    if routing_enabled():
+        return handle_message(db, user_id, phone, text)
+    return _fallback_handle(db, user_id, phone, text)

@@ -176,8 +176,28 @@ def send_task_acknowledgment(
     Returns:
         Result dict with success status
     """
-    # Format due date if it's a datetime object
-    if due_date and hasattr(due_date, 'strftime'):
+    message = format_task_acknowledgment(
+        task_type=task_type,
+        course=course,
+        due_date=due_date,
+        is_duplicate=is_duplicate,
+        needs_review=needs_review,
+        dashboard_url=dashboard_url,
+    )
+    result = send_text_message(to_phone, message)
+    return {"success": result.get("sent", False), **result}
+
+
+def format_task_acknowledgment(
+    task_type: str,
+    course: Optional[str],
+    due_date: Optional[str],
+    is_duplicate: bool = False,
+    needs_review: bool = False,
+    dashboard_url: str = "",
+) -> str:
+    """Same save-task ack text WhatsApp sends — reused by the web assistant."""
+    if due_date and hasattr(due_date, "strftime"):
         from datetime import timezone, timedelta
         pkt = timezone(timedelta(hours=5))
         if due_date.tzinfo is None:
@@ -189,38 +209,31 @@ def send_task_acknowledgment(
     dashboard_url = normalize_dashboard_url(dashboard_url)
 
     if is_duplicate:
-        message = (
+        return (
             f"🔁 This looks like something you already sent.\n\n"
             f"Check your dashboard to confirm:\n{dashboard_url}"
         )
-    elif needs_review or not due_date:
-        # Date is uncertain or missing — this is the real review case
+    if needs_review or not due_date:
         course_part = f" for *{course}*" if course else ""
-        message = (
+        return (
             f"⚠️ Saved{course_part} but I couldn't determine the due date.\n\n"
             f"Please set it here:\n{dashboard_url}"
         )
-    elif course and due_date:
-        # Both course and date detected — clean confirmation
-        message = (
+    if course and due_date:
+        return (
             f"✅ Got it! *{task_type.title()}* for *{course}*\n"
             f"📅 Due: *{due_date}*\n\n"
             f"Track it here:\n{dashboard_url}"
         )
-    elif due_date:
-        # Date known, course missing — save succeeded but note missing course
-        message = (
+    if due_date:
+        return (
             f"✅ Saved! *{task_type.title()}* due *{due_date}*\n"
             f"❓ Course not set — tap to assign it:\n{dashboard_url}"
         )
-    else:
-        message = (
-            f"❌ I received your message but couldn't extract the details.\n\n"
-            f"Open your dashboard to fill them in:\n{dashboard_url}"
-        )
-
-    result = send_text_message(to_phone, message)
-    return {"success": result.get("sent", False), **result}
+    return (
+        f"❌ I received your message but couldn't extract the details.\n\n"
+        f"Open your dashboard to fill them in:\n{dashboard_url}"
+    )
 
 
 def send_reminder(

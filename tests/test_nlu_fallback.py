@@ -22,6 +22,7 @@ from utils.nlu import (
     handle_message,
     _fallback_handle,
     routing_enabled,
+    dispatch_message,
     GREETING_REPLY,
     OUT_OF_SCOPE_REPLY,
     OUT_OF_SCOPE_CASUAL,
@@ -186,21 +187,31 @@ class TestFallbackHandle:
 # ── handle_message — save_task passthrough ────────────────────────────────────
 
 class TestHandleMessageSaveTask:
-    def test_save_task_returns_sentinel(self, monkeypatch):
-        """When LLM #1 says save_task, return {"action": "save_task"} immediately."""
-        import json, requests as req, unittest.mock as mock
-
-        monkeypatch.setenv("GROQ_API_KEY", "test-key")
-        m = mock.MagicMock()
-        m.raise_for_status.return_value = None
-        m.json.return_value = {
-            "choices": [{"message": {"content": json.dumps({"intent": "save_task", "language": "mixed", "confidence": 0.96})}}],
-            "usage": {},
-        }
-        monkeypatch.setattr(req, "post", lambda *a, **kw: m)
-
-        result = handle_message(MagicMock(), "wa:1234", "+92300", "kal TOA ka quiz hai")
-        assert result["action"] == "save_task"
+    def test_incomplete_save_task_asks_instead_of_persisting(self, monkeypatch):
+        """Incomplete create is a clarification reply — never a save_task fallthrough."""
+        monkeypatch.setattr("utils.nlu.understand", lambda *a, **kw: {
+            "intent": "save_task", "language": "mixed", "confidence": 0.96,
+        })
+        monkeypatch.setattr("utils.parse_task.parse_task", lambda *a, **kw: {
+            "task_type": "quiz",
+            "course": None,
+            "title": "Quiz",
+            "due_date": None,
+            "quiz_material": None,
+            "quiz_duration": None,
+            "quiz_time": None,
+            "confidence": 0.5,
+            "parse_method": "test",
+            "needs_review": True,
+            "has_explicit_time": False,
+        })
+        import mongomock
+        db = mongomock.MongoClient().db
+        db.users.insert_one({"user_id": "wa:1234", "settings": {}})
+        result = handle_message(db, "wa:1234", "+92300", "kal TOA ka quiz hai")
+        assert result["action"] == "reply"
+        assert "Task saved" not in result["text"]
+        assert db.tasks.count_documents({}) == 0
 
 
 # ── handle_message — out_of_scope variants from LLM #1 ────────────────────────
@@ -256,3 +267,21 @@ class TestHandleMessageOutOfScope:
         result = handle_message(None, "wa:1234", "+92300", "asdfgh")
         assert result["action"] == "reply"
         assert result["text"] == OUT_OF_SCOPE_REPLY
+
+
+# ── dispatch_message — shared WhatsApp / web entry ────────────────────────────
+
+class TestDispatchMessage:
+    def test_routing_off_uses_fallback(self, monkeypatch):
+        monkeypatch.setenv("NLU_LLM_ROUTING_ENABLED", "false")
+        result = dispatch_message(None, "wa:1234", "+92300", "hi")
+        assert result["action"] == "reply"
+        assert result.get("intent") == "greeting"
+
+    def test_routing_on_uses_handle_message(self, monkeypatch):
+        monkeypatch.setenv("NLU_LLM_ROUTING_ENABLED", "true")
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        result = dispatch_message(None, "wa:1234", "+92300", "hi")
+        assert result["action"] == "reply"
+        assert result["text"] == GREETING_REPLY
+        assert result.get("intent") == "greeting"

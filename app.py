@@ -32,7 +32,12 @@ from utils.auth import (
     verify_refresh_token,
     jwt_required,
 )
-from utils.whatsapp_sender import send_otp_message, send_task_acknowledgment, send_text_message
+from utils.whatsapp_sender import (
+    send_otp_message,
+    send_task_acknowledgment,
+    send_text_message,
+    format_task_acknowledgment,
+)
 from utils.rate_limiter import rate_limit_ip, rate_limit_phone, check_webhook_rate_limit
 from utils.errors import make_error_response, register_error_handlers
 from utils.scheduler import start_scheduler
@@ -761,6 +766,96 @@ def _is_course_unresolved(parsed_course: Optional[str], source_key: str) -> bool
     return False
 
 
+def persist_inbound_task(
+    db,
+    *,
+    user_id: str,
+    phone: Optional[str],
+    text: str,
+    source_key: str,
+    is_forwarded: bool = False,
+    forwarded_from: Optional[str] = None,
+    source_message_id: Optional[str] = None,
+    source_request_id: Optional[str] = None,
+) -> dict:
+    """
+    Shared save-task persist for WhatsApp and the web assistant.
+
+    Uses the same academic context + parse_task + duplicate fingerprint as the
+    webhook. Never reads timetable/section from the client.
+    """
+    mapped_course = _resolve_course_from_mapping(db, user_id, source_key) if user_id else None
+    _ctx = get_user_academic_context(db, user_id) if user_id else {}
+    parse_result = parse_task(
+        text,
+        course_hint=mapped_course,
+        user_courses=_ctx.get("courses"),
+        overrides=_ctx.get("aliases"),
+    )
+    task_status = "needs_review" if parse_result["needs_review"] else "pending"
+    course_unresolved = _is_course_unresolved(parse_result.get("course"), source_key)
+    course_resolution_method = (
+        "mapped" if mapped_course else ("heuristic" if parse_result.get("course") else "unresolved")
+    )
+
+    fingerprint = make_fingerprint(
+        user_id=user_id,
+        course=parse_result.get("course"),
+        title=parse_result.get("title"),
+        due_date=parse_result.get("due_date"),
+    )
+    is_potential_duplicate = check_duplicate(db, user_id, fingerprint)
+
+    task_doc = {
+        "user_id": user_id,
+        "phone_number": phone,
+        "task_type": parse_result["task_type"],
+        "raw_message": text,
+        "fingerprint": fingerprint,
+        "is_potential_duplicate": is_potential_duplicate,
+        "parsed_course": parse_result["course"],
+        "parsed_title": parse_result["title"],
+        "parsed_due_date": parse_result["due_date"],
+        "quiz_material": parse_result["quiz_material"],
+        "quiz_duration": parse_result["quiz_duration"],
+        "quiz_time": parse_result["quiz_time"],
+        "parse_confidence": parse_result["confidence"],
+        "parse_method": parse_result.get("parse_method", "unknown"),
+        "groq_raw_response": parse_result.get("groq_raw_response"),
+        "needs_review": parse_result["needs_review"],
+        "status": task_status,
+        "course_unresolved": course_unresolved,
+        "date_uncertain": parse_result.get("date_uncertain", False),
+        "has_explicit_time": parse_result.get("has_explicit_time", True),
+        "course_resolution_method": course_resolution_method,
+        "source_key": source_key,
+        "is_forwarded": is_forwarded,
+        "forwarded_from": forwarded_from,
+        "course_mapped_from_source": bool(mapped_course),
+        "source_message_id": source_message_id,
+        "source_request_id": source_request_id,
+        "created_at": _utc_now(),
+        "updated_at": _utc_now(),
+    }
+
+    inserted_task_id = None
+    duplicate_key = False
+    try:
+        db.tasks.insert_one(task_doc)
+        inserted_task_id = str(task_doc["_id"])
+    except DuplicateKeyError:
+        duplicate_key = True
+
+    return {
+        "parse_result": parse_result,
+        "inserted_task_id": inserted_task_id,
+        "is_potential_duplicate": is_potential_duplicate,
+        "course_unresolved": course_unresolved,
+        "duplicate_key": duplicate_key,
+        "task_doc": task_doc,
+    }
+
+
 # ── Admin-managed official timetable helpers ────────────────────────────────────
 # See docs/backend-audit-15-09-2026/08-admin-timetable-architecture.md
 
@@ -992,6 +1087,8 @@ def ensure_mongo_indexes() -> None:
     db.archived_reminders_sent.create_index("user_id")
     db.archived_reminders_sent.create_index("sent_at")
     ensure_conversation_index(db)
+    from utils.nlu_session import ensure_nlu_session_index
+    ensure_nlu_session_index(db)
     # User timetables — one document per user, stores ALL parsed sections
     db.user_timetables.create_index("user_id", unique=True)
     # Official (admin-managed) timetables — versioned, section-indexed
@@ -1211,189 +1308,59 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                         upsert=True,
                     )
 
-                # ── Conversational context: handle ongoing dialog first ────────
-                active_conv = get_active_conversation(db, normalized_sender or sender)
-                if active_conv:
-                    conv_result = handle_reply(db, active_conv, text_body)
-                    action = conv_result["action"]
-                    prompt = conv_result.get("prompt")
+                # Pending NLU state is context inside dispatch_message, not a router.
 
-                    if action == "update_task":
-                        task_oid = _parse_object_id(conv_result["task_id"])
-                        if task_oid and conv_result.get("updates"):
-                            from utils.parse_task import _utc_now as _p_now
-                            updates = dict(conv_result["updates"])
-                            updates["updated_at"] = _utc_now()
-                            updates["corrected_at"] = _utc_now()
-                            db.tasks.update_one({"_id": task_oid}, {"$set": updates})
-                            updated_task = db.tasks.find_one({"_id": task_oid})
-                            # Build confirmation ACK
-                            dashboard_url = _normalize_dashboard_url(
-                                get_env("DASHBOARD_URL", default="https://duemate-dashboard.vercel.app")
-                            )
-                            course = updated_task.get("parsed_course") if updated_task else None
-                            due_date = updated_task.get("parsed_due_date") if updated_task else None
-                            task_type = updated_task.get("task_type", "task") if updated_task else "task"
-                            if due_date and hasattr(due_date, "strftime"):
-                                from datetime import timedelta, timezone
-                                _PKT = timezone(timedelta(hours=5))
-                                # If naive, assume it's UTC (pymongo without tz_aware does this)
-                                # Or if it's aware, astimezone to PKT
-                                if due_date.tzinfo is None:
-                                    due_pkt = due_date.replace(tzinfo=timezone.utc).astimezone(_PKT)
-                                else:
-                                    due_pkt = due_date.astimezone(_PKT)
-                                due_fmt = due_pkt.strftime("%b %d at %I:%M %p")
-                            elif due_date:
-                                due_fmt = str(due_date)[:16]
-                            else:
-                                due_fmt = None
-                            course_part = f" for *{course}*" if course else ""
-                            due_part = f" — due *{due_fmt}*" if due_fmt else ""
-                            confirm_msg = f"✅ Got it{course_part}{due_part}. All set!\n\n{dashboard_url}"
-                            try:
-                                send_text_message(normalized_sender or sender, confirm_msg)
-                            except Exception as e:
-                                app.logger.warning("conv_confirm_send_failed error=%s", e)
-                        summary["inbound_messages"] += 1
-                        continue
-
-                    if prompt:
-                        try:
-                            send_text_message(normalized_sender or sender, prompt)
-                        except Exception as e:
-                            app.logger.warning("conv_prompt_send_failed error=%s", e)
-                    summary["inbound_messages"] += 1
-                    continue
-                # ─────────────────────────────────────────────────────────────
-
-                # ── Agent / NLU Intent Classification & Routing ───────────────
-                if os.getenv("NLU_LLM_ROUTING_ENABLED", "false").lower() in ("1", "true", "yes"):
-                    # ── NLU path (LLM #1 → backend → optional LLM #2) ────────
-                    from utils.nlu import handle_message as _nlu_handle  # type: ignore
-                    try:
-                        _nlu_result = _nlu_handle(
-                            db, user_id, normalized_sender or sender, text_body
-                        )
-                    except Exception as _nlu_err:
-                        app.logger.warning(
-                            "nlu_handle_error fallback to legacy err=%s", _nlu_err
-                        )
-                        _nlu_result = {"action": "save_task"}
-
-                    if _nlu_result["action"] == "reply":
-                        summary["inbound_messages"] += 1
-                        app.logger.info(
-                            "nlu_handled from=%s text=%r", sender, text_body[:50]
-                        )
-                        try:
-                            send_text_message(
-                                to_number=normalized_sender or sender,
-                                message_body=_nlu_result["text"],
-                                preview_url=False,
-                            )
-                        except Exception as _send_err:
-                            app.logger.warning(
-                                "nlu_reply_send_failed from=%s error=%s", sender, _send_err
-                            )
-                        continue  # don't save_task
-                    # action == "save_task" → fall through to parse_task below
-                    app.logger.info(
-                        "nlu_save_task_proceeding text=%r", text_body[:50]
-                    )
-                else:
-                    # ── Legacy path: keyword + Groq intent classifier ─────────
-                    from utils.agent import classify_intent, handle_agent_query
-                    intent = classify_intent(text_body)
-                    app.logger.info(
-                        "checking_intent text=%r intent=%s", text_body, intent
-                    )
-
-                    if intent in ("greeting", "query_schedule", "query_tasks"):
-                        app.logger.info(
-                            "agent_handled_intent intent=%s from=%s message=%s",
-                            intent, sender, text_body[:50],
-                        )
-                        summary["inbound_messages"] += 1
-                        agent_reply = handle_agent_query(
-                            db, user_id, normalized_sender or sender, text_body, intent
-                        )
-                        try:
-                            send_text_message(
-                                to_number=normalized_sender or sender,
-                                message_body=agent_reply,
-                                preview_url=False,
-                            )
-                        except Exception as e:
-                            app.logger.warning(
-                                "agent_reply_failed from=%s error=%s", sender, str(e)
-                            )
-                        continue
-
-                    app.logger.info(
-                        "intent_save_task_proceeding_to_parse text=%s", repr(text_body)
-                    )
-
-                mapped_course = _resolve_course_from_mapping(db, user_id, source_key) if user_id else None
-                _ctx = get_user_academic_context(db, user_id) if user_id else {}
-                parse_result = parse_task(
-                    text_body,
-                    course_hint=mapped_course,
-                    user_courses=_ctx.get("courses"),
-                    overrides=_ctx.get("aliases"),
-                )
-                task_status = "needs_review" if parse_result["needs_review"] else "pending"
-                course_unresolved = _is_course_unresolved(parse_result.get("course"), source_key)
-                course_resolution_method = "mapped" if mapped_course else ("heuristic" if parse_result.get("course") else "unresolved")
-                
-                # Generate fingerprint for duplicate detection
-                fingerprint = make_fingerprint(
-                    user_id=user_id,
-                    course=parse_result.get("course"),
-                    title=parse_result.get("title"),
-                    due_date=parse_result.get("due_date")
-                )
-                is_potential_duplicate = check_duplicate(db, user_id, fingerprint)
-                
-                task_doc = {
-                    "user_id": user_id,
-                    "phone_number": normalized_sender or sender,
-                    "task_type": parse_result["task_type"],
-                    "raw_message": text_body,
-                    "fingerprint": fingerprint,
-                    "is_potential_duplicate": is_potential_duplicate,
-                    "parsed_course": parse_result["course"],
-                    "parsed_title": parse_result["title"],
-                    "parsed_due_date": parse_result["due_date"],
-                    "quiz_material": parse_result["quiz_material"],
-                    "quiz_duration": parse_result["quiz_duration"],
-                    "quiz_time": parse_result["quiz_time"],
-                    "parse_confidence": parse_result["confidence"],
-                    "parse_method": parse_result.get("parse_method", "unknown"),
-                    "groq_raw_response": parse_result.get("groq_raw_response"),
-                    "needs_review": parse_result["needs_review"],
-                    "status": task_status,
-                    "course_unresolved": course_unresolved,
-                    "date_uncertain": parse_result.get("date_uncertain", False),
-                    "has_explicit_time": parse_result.get("has_explicit_time", True),
-                    "course_resolution_method": course_resolution_method,
-                    "source_key": source_key,
-                    "is_forwarded": is_forwarded,
-                    "forwarded_from": forwarded_from,
-                    "course_mapped_from_source": bool(mapped_course),
-                    "source_message_id": message_id,
-                    "source_request_id": request_id,
-                    "created_at": _utc_now(),
-                    "updated_at": _utc_now(),
-                }
-
+                from utils.nlu import dispatch_message as _dispatch_message  # type: ignore
                 try:
-                    db.tasks.insert_one(task_doc)
-                    inserted_task_id = str(task_doc["_id"])
+                    _nlu_result = _dispatch_message(
+                        db, user_id, normalized_sender or sender, text_body
+                    )
+                except Exception as _nlu_err:
+                    app.logger.warning(
+                        "nlu_handle_error fallback to save_task err=%s", _nlu_err
+                    )
+                    _nlu_result = {"action": "save_task", "intent": "save_task"}
+
+                if _nlu_result["action"] == "reply":
+                    summary["inbound_messages"] += 1
+                    app.logger.info(
+                        "nlu_handled from=%s intent=%s text=%r",
+                        sender, _nlu_result.get("intent"), text_body[:50],
+                    )
+                    try:
+                        send_text_message(
+                            to_number=normalized_sender or sender,
+                            message_body=_nlu_result["text"],
+                            preview_url=False,
+                        )
+                    except Exception as _send_err:
+                        app.logger.warning(
+                            "nlu_reply_send_failed from=%s error=%s", sender, _send_err
+                        )
+                    continue
+                app.logger.info(
+                    "nlu_save_task_proceeding text=%r", text_body[:50]
+                )
+
+                saved = persist_inbound_task(
+                    db,
+                    user_id=user_id,
+                    phone=normalized_sender or sender,
+                    text=text_body,
+                    source_key=source_key,
+                    is_forwarded=is_forwarded,
+                    forwarded_from=forwarded_from,
+                    source_message_id=message_id,
+                    source_request_id=request_id,
+                )
+                parse_result = saved["parse_result"]
+                inserted_task_id = saved["inserted_task_id"]
+                is_potential_duplicate = saved["is_potential_duplicate"]
+                course_unresolved = saved["course_unresolved"]
+                if inserted_task_id:
                     summary["tasks_created"] += 1
-                except DuplicateKeyError:
+                if saved["duplicate_key"]:
                     summary["duplicates"] += 1
-                    inserted_task_id = None
 
                 if parse_result["needs_review"]:
                     summary["tasks_needs_review"] += 1
@@ -1407,57 +1374,22 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     get_env("DASHBOARD_URL", default="https://duemate-dashboard.vercel.app")
                 )
 
-                # ── Decide whether to start a conversation ───────────────────
-                date_missing = parse_result.get("needs_review") or not parse_result.get("due_date")
-                start_conv_prompt = None
-                if inserted_task_id and not is_potential_duplicate and sender:
-                    missing = None
-                    if course_unresolved and date_missing:
-                        missing = "both"
-                    elif course_unresolved:
-                        missing = "course"
-                    elif date_missing:
-                        missing = "date"
+                # NLU owns clarification. Never start the legacy course menu.
+                send_result = send_task_acknowledgment(
+                    to_phone=normalized_sender or sender,
+                    task_type=parse_result["task_type"],
+                    course=parse_result.get("course"),
+                    due_date=parse_result.get("due_date"),
+                    confidence=parse_result.get("confidence", 0.0),
+                    is_duplicate=is_potential_duplicate,
+                    needs_review=parse_result.get("needs_review", False),
+                    dashboard_url=dashboard_url
+                ) if sender else {"success": False}
 
-                    if missing:
-                        try:
-                            start_conv_prompt = start_conversation(
-                                db,
-                                phone=normalized_sender or sender,
-                                user_id=user_id,
-                                task_id=inserted_task_id,
-                                missing=missing,
-                            )
-                        except Exception as e:
-                            app.logger.warning("conv_start_failed error=%s", e)
-                # ─────────────────────────────────────────────────────────────
-
-                if start_conv_prompt:
-                    # First send a brief save confirmation, then the prompt
-                    save_ack = "✅ Task saved!"
-                    if parse_result.get("course") and parse_result.get("due_date"):
-                        save_ack = f"✅ Saved *{parse_result['task_type']}*."
-                    try:
-                        send_text_message(normalized_sender or sender, save_ack)
-                        send_text_message(normalized_sender or sender, start_conv_prompt)
-                    except Exception as e:
-                        app.logger.warning("conv_ack_send_failed error=%s", e)
+                if send_result.get("success"):
+                    summary["acked"] += 1
                 else:
-                    send_result = send_task_acknowledgment(
-                        to_phone=normalized_sender or sender,
-                        task_type=parse_result["task_type"],
-                        course=parse_result.get("course"),
-                        due_date=parse_result.get("due_date"),
-                        confidence=parse_result.get("confidence", 0.0),
-                        is_duplicate=is_potential_duplicate,
-                        needs_review=parse_result.get("needs_review", False),
-                        dashboard_url=dashboard_url
-                    ) if sender else {"success": False}
-
-                    if send_result.get("success"):
-                        summary["acked"] += 1
-                    else:
-                        summary["ack_failures"] += 1
+                    summary["ack_failures"] += 1
 
 
             for status in value.get("statuses", []):
@@ -3674,35 +3606,44 @@ def create_app() -> Flask:
         if not message:
             return jsonify({"error": "message_required"}), 400
 
-        if os.getenv("NLU_LLM_ROUTING_ENABLED", "false").lower() in ("1", "true", "yes"):
-            from utils.nlu import handle_message as _nlu_handle  # type: ignore
-            try:
-                _nlu_result = _nlu_handle(
-                    db,
-                    user.get("user_id"),
-                    user.get("phone_number"),
-                    message,
-                )
-                if _nlu_result["action"] == "reply":
-                    return jsonify({"reply": _nlu_result["text"], "intent": "nlu"})
-                # save_task from dashboard chat → fall through to legacy path
-            except Exception as _nlu_err:
-                app.logger.warning("assistant_chat nlu_failed err=%s", _nlu_err)
-                # fall through on error
+        # Identity and academic context come from the JWT user only.
+        # Ignore any timetable/section/user_id the client might send.
+        user_id = user.get("user_id")
+        phone = user.get("phone_number")
 
-        from utils.agent import classify_intent, handle_agent_query
-        intent = classify_intent(message)
-        reply = handle_agent_query(
+        from utils.nlu import dispatch_message as _dispatch_message  # type: ignore
+        try:
+            result = _dispatch_message(db, user_id, phone, message)
+        except Exception as _nlu_err:
+            app.logger.warning("assistant_chat nlu_failed err=%s", _nlu_err)
+            result = {"action": "save_task", "intent": "save_task"}
+
+        if result.get("action") == "reply":
+            return jsonify({
+                "reply": result.get("text") or "",
+                "intent": result.get("intent") or "nlu",
+            })
+
+        saved = persist_inbound_task(
             db,
-            user.get("user_id"),
-            user.get("phone_number"),
-            message,
-            intent,
+            user_id=user_id,
+            phone=phone,
+            text=message,
+            source_key="web_assistant",
         )
-        return jsonify({
-            "reply": reply,
-            "intent": intent,
-        })
+        dashboard_url = _normalize_dashboard_url(
+            get_env("DASHBOARD_URL", default="https://duemate-dashboard.vercel.app")
+        )
+        parse_result = saved["parse_result"]
+        ack = format_task_acknowledgment(
+            task_type=parse_result["task_type"],
+            course=parse_result.get("course"),
+            due_date=parse_result.get("due_date"),
+            is_duplicate=saved["is_potential_duplicate"] or saved["duplicate_key"],
+            needs_review=parse_result.get("needs_review", False),
+            dashboard_url=dashboard_url,
+        )
+        return jsonify({"reply": ack, "intent": "save_task"})
 
     @app.get("/webhook")
     @app.get("/webhook/messages")
