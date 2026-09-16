@@ -75,6 +75,41 @@ def _serialize_for_json(value):
     return value
 
 
+def _enrich_messages_with_contact_names(db, messages: list) -> list:
+    """Attach from_name from contacts.profile_name (messages.from == contacts.wa_id).
+
+    One batch lookup. Does not write to the messages collection. Missing or
+    blank contact names leave from_name as None — never invent a name.
+    """
+    if not messages:
+        return messages
+
+    senders = []
+    seen = set()
+    for msg in messages:
+        sender = msg.get("from")
+        if sender and sender not in seen:
+            seen.add(sender)
+            senders.append(sender)
+
+    names = {}
+    if senders:
+        for contact in db.contacts.find(
+            {"wa_id": {"$in": senders}},
+            {"wa_id": 1, "profile_name": 1, "_id": 0},
+        ):
+            wa_id = contact.get("wa_id")
+            name = contact.get("profile_name")
+            if wa_id and isinstance(name, str):
+                name = name.strip()
+                if name:
+                    names[wa_id] = name
+
+    for msg in messages:
+        msg["from_name"] = names.get(msg.get("from"))
+    return messages
+
+
 def _parse_object_id(value: str) -> Optional[ObjectId]:
     try:
         return ObjectId(value)
@@ -1708,7 +1743,8 @@ def create_app() -> Flask:
         try:
             ensure_mongo_indexes()
             cursor = db.messages.find({}, {"_id": 0}).sort("received_at", -1).limit(limit)
-            items = [_serialize_for_json(doc) for doc in cursor]
+            items = _enrich_messages_with_contact_names(db, list(cursor))
+            items = [_serialize_for_json(doc) for doc in items]
             return jsonify({"items": items, "count": len(items)})
         except Exception as exc:
             app.logger.exception("recent_messages_failed error=%s", str(exc))

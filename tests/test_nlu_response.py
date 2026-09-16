@@ -160,3 +160,11 @@ class TestRespondFlagOn:
         grounded = {"kind": "greeting", "text": "Hey! 👋 ...", "language": "ur", "no_timetable": False}
         result = respond(grounded)
         assert result == "Hey! 👋 ..."
+
+    def test_out_of_scope_skips_llm(self, monkeypatch):
+        """Canned out-of-scope variants must not be rewritten by LLM #2."""
+        monkeypatch.setenv("NLU_LLM_RESPONSE_ENABLED", "true")
+        det = "Haha, glad it's working 😄. I can help with your timetable and academic tasks."
+        grounded = {"kind": "out_of_scope", "text": det, "language": "ur", "no_timetable": False}
+        result = respond(grounded)
+        assert result == det

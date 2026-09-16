@@ -48,7 +48,13 @@ _VALID_DAYS = frozenset({
 })
 _VALID_DUE = frozenset({"today", "tomorrow", "this_week", "overdue"})
 _VALID_LANGUAGES = frozenset({"en", "ur", "mixed"})
+_VALID_OOS_KINDS = frozenset({"casual", "internal", "unrelated"})
 _TIME_RE = re.compile(r"^\d{2}:\d{2}$")
+_OOS_TOPIC_RE = re.compile(r"^[a-z]+(?:[ -][a-z]+){0,2}$")
+_OOS_TOPIC_BLOCKED = frozenset({
+    "prompt", "prompts", "instruction", "instructions", "system", "backend",
+    "secret", "secrets", "password", "token", "key", "api", "internal",
+})
 
 # ── Config helpers ────────────────────────────────────────────────────────────
 
@@ -97,6 +103,18 @@ OUT_OF_SCOPE_REPLY = (
     "Try asking:\n"
     "• _\"when is my next class?\"_\n"
     "• _\"what do I have due this week?\"_"
+)
+
+OUT_OF_SCOPE_CASUAL = (
+    "Haha, glad it's working 😄. I can help with your timetable and academic tasks."
+)
+OUT_OF_SCOPE_INTERNAL = (
+    "I can help with your timetable and academic tasks, but I can't provide "
+    "internal system instructions."
+)
+OUT_OF_SCOPE_UNRELATED = (
+    "I can help with your timetable and academic tasks, but I can't help with "
+    "questions outside that."
 )
 
 # ── Trivial-greeting fast path ────────────────────────────────────────────────
@@ -176,6 +194,39 @@ def _validate_time(s) -> Optional[str]:
         return s.strip()
     return None
 
+
+def _sanitize_oos_topic(raw) -> Optional[str]:
+    """Allow a short public topic label; never keep instruction/secret wording."""
+    if not raw or not isinstance(raw, str):
+        return None
+    topic = re.sub(r"[^a-zA-Z\s-]", "", raw).strip().lower()
+    topic = re.sub(r"\s+", " ", topic)
+    if not topic or not _OOS_TOPIC_RE.match(topic):
+        return None
+    words = topic.replace("-", " ").split()
+    if any(w in _OOS_TOPIC_BLOCKED for w in words):
+        return None
+    return topic
+
+
+def _out_of_scope_reply(request: dict) -> str:
+    """Deterministic reply from LLM #1's out_of_scope kind — no extra model call."""
+    oos = request.get("out_of_scope") or {}
+    kind = oos.get("kind")
+    topic = oos.get("topic")
+    if kind == "casual":
+        return OUT_OF_SCOPE_CASUAL
+    if kind == "internal":
+        return OUT_OF_SCOPE_INTERNAL
+    if kind == "unrelated":
+        if topic:
+            return (
+                "I can help with your timetable and academic tasks, but I can't "
+                f"help with general {topic} questions."
+            )
+        return OUT_OF_SCOPE_UNRELATED
+    return OUT_OF_SCOPE_REPLY
+
 def _clamp_request(raw: dict) -> dict:
     """
     Validate and clamp a raw LLM #1 response to the known schema.
@@ -224,6 +275,13 @@ def _clamp_request(raw: dict) -> dict:
         result["task"] = {
             "filter_course": task.get("filter_course") or None,
             "due": _clamp(task.get("due"), _VALID_DUE, None),
+        }
+
+    elif intent == "out_of_scope":
+        oos = raw.get("out_of_scope") or {}
+        result["out_of_scope"] = {
+            "kind": _clamp(str(oos.get("kind") or "").lower(), _VALID_OOS_KINDS, None),
+            "topic": _sanitize_oos_topic(oos.get("topic")),
         }
 
     return result
@@ -307,10 +365,17 @@ def _resolve_day(day_str: Optional[str]) -> Optional[str]:
 
 def _format_pending_tasks(tasks: list) -> str:
     """Format a list of task dicts into a numbered WhatsApp string."""
+    from utils.parse_task import compose_task_title
+
     formatted = []
     for idx, t in enumerate(tasks, 1):
         course = t.get("parsed_course") or "Unknown Course"
-        title = t.get("parsed_title") or "Task"
+        title = compose_task_title(
+            t.get("parsed_course"),
+            t.get("task_type"),
+            t.get("parsed_title"),
+            t.get("raw_message"),
+        )
         due = t.get("parsed_due_date")
         if due:
             if due.tzinfo:
@@ -459,7 +524,7 @@ def execute(request: dict, db, user_id: str) -> dict:
             return result
 
         if intent == "out_of_scope":
-            result["text"] = OUT_OF_SCOPE_REPLY
+            result["text"] = _out_of_scope_reply(request)
             return result
 
         if intent == "schedule_query":

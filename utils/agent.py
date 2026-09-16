@@ -233,10 +233,17 @@ def handle_agent_query(db, user_id: str, phone: str, message_text: str, intent: 
             return "You have no pending assignments or quizzes! Great job! 🎉"
 
         now_pkt = datetime.now(_PKT)
+        from utils.parse_task import compose_task_title
+
         formatted = []
         for idx, t in enumerate(tasks, 1):
             course = t.get("parsed_course") or "Unknown Course"
-            title = t.get("parsed_title") or "Task"
+            title = compose_task_title(
+                t.get("parsed_course"),
+                t.get("task_type"),
+                t.get("parsed_title"),
+                t.get("raw_message"),
+            )
             due = t.get("parsed_due_date")
             if due:
                 # Convert UTC → PKT for display

@@ -369,10 +369,60 @@ def _normalize_course_value(course: Optional[str]) -> Optional[str]:
     return None
 
 
+_GENERIC_TITLES = {
+    "assignment", "quiz", "task", "deadline", "exam", "project", "homework",
+    "hw", "report", "untitled task",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+}
+
+_HEADING_HINTS = (
+    (re.compile(r"\bprojects?\b", re.I), "Project"),
+    (re.compile(r"\bexams?\b|\bmidterms?\b|\bfinals?\b", re.I), "Exam"),
+    (re.compile(r"\bquiz(?:zes)?\b|\bmcqs?\b", re.I), "Quiz"),
+    (re.compile(r"\bassignments?\b|\bhomework\b|\bhw\b", re.I), "Assignment"),
+)
+
+
 def _is_generic_title(title: Optional[str]) -> bool:
     if not title:
         return True
-    return title.strip().lower() in {"assignment", "quiz", "task", "deadline", "exam"}
+    return title.strip().lower() in _GENERIC_TITLES
+
+
+def _heading_label(
+    task_type: Optional[str],
+    source_text: Optional[str] = None,
+    existing_title: Optional[str] = None,
+) -> str:
+    blob = f"{existing_title or ''} {source_text or ''}"
+    for pattern, label in _HEADING_HINTS:
+        if pattern.search(blob):
+            return label
+    if task_type:
+        return str(task_type).replace("_", " ").title()
+    return "Task"
+
+
+def compose_task_title(
+    course: Optional[str],
+    task_type: Optional[str],
+    existing_title: Optional[str] = None,
+    source_text: Optional[str] = None,
+) -> str:
+    """Build a display heading from already-parsed course + type. Never touches dates."""
+    if source_text:
+        numbered = _extract_numbered_title(source_text)
+        if numbered:
+            return numbered[:120]
+    existing = (existing_title or "").strip()
+    course_name = (course or "").strip() or None
+    if existing and not _is_generic_title(existing):
+        if not course_name or existing.lower() != course_name.lower():
+            return existing[:120]
+    kind = _heading_label(task_type, source_text, existing)
+    if course_name:
+        return f"{course_name} {kind}"[:120]
+    return kind[:120]
 
 
 def _extract_deterministic_fields(
@@ -395,6 +445,7 @@ def _extract_deterministic_fields(
     numbered = _extract_numbered_title(normalized)
     if numbered:
         title = numbered
+    title = compose_task_title(course, task_type, title, normalized)
 
     return {
         "task_type": task_type,
@@ -660,7 +711,8 @@ def extract_title(text: str, task_type: str, course: Optional[str]) -> str:
         title = re.sub(rf"\b{re.escape(word)}\b", "", title, flags=re.IGNORECASE)
 
     title = re.sub(
-        r"\b(?:due|by|on|before|submit|submission|deadline|tomorrow|tommorow|tommorrow|today)\b",
+        r"\b(?:due|by|on|before|submit|submission|deadline|tomorrow|tommorow|tommorrow|today|"
+        r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
         "",
         title,
         flags=re.IGNORECASE,
@@ -681,11 +733,8 @@ def extract_title(text: str, task_type: str, course: Optional[str]) -> str:
     else:
         title = ""
 
-    if len(title) < 4:
-        if course:
-            title = f"{course} {task_type.title()}"
-        else:
-            title = task_type.title()
+    if len(title) < 4 or _is_generic_title(title):
+        return compose_task_title(course, task_type, title, text)
 
     return title[:120]
 
@@ -857,6 +906,7 @@ def _merge_parse_results(
     course = _reconcile_course(
         groq_course, deterministic.get("course"), user_courses=user_courses, overrides=overrides
     )
+    title = compose_task_title(course, task_type, title, text)
 
     confidence = _compute_parse_confidence(
         task_type,

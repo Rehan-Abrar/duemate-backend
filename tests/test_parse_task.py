@@ -15,6 +15,7 @@ from utils.parse_task import (
     _normalize_due_date,
     _extract_json_from_response,
     _extract_deterministic_fields,
+    compose_task_title,
     detect_course,
     detect_due_date,
     extract_title,
@@ -197,3 +198,64 @@ class TestTimeParsing:
         assert result["due_date"] is not None
         assert result["due_date"].hour == 18  # 23:59 PKT -> 18:59 UTC
         assert result["due_date"].minute == 59
+
+
+class TestComposeTaskTitle:
+    def test_course_plus_quiz(self):
+        assert compose_task_title("Information Security", "quiz", "quiz") == "Information Security Quiz"
+
+    def test_course_plus_assignment(self):
+        assert (
+            compose_task_title("Compiler Construction", "assignment", "assignment")
+            == "Compiler Construction Assignment"
+        )
+
+    def test_course_plus_project(self):
+        assert (
+            compose_task_title(
+                "Computer Vision",
+                "assignment",
+                "project",
+                "computer vision project due monday",
+            )
+            == "Computer Vision Project"
+        )
+
+    def test_no_course_quiz(self):
+        assert compose_task_title(None, "quiz", "quiz") == "Quiz"
+
+    def test_existing_types_exam(self):
+        assert compose_task_title("Computer Networks", "exam", "exam") == "Computer Networks Exam"
+
+    def test_numbered_title_preserved(self):
+        assert (
+            compose_task_title(
+                "Advanced DBMS",
+                "assignment",
+                "Assignment 3",
+                "Advanced DBMS assignment 3 due on 12 July 2026",
+            )
+            == "Assignment 3"
+        )
+
+    def test_does_not_change_due_date(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("GROQ_API_KEY_v2", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        courses = ["Information Security", "Computer Vision"]
+        result = parse_task("information security quiz on Monday", user_courses=courses)
+        assert result["title"] == "Information Security Quiz"
+        assert result["course"] == "Information Security"
+        assert result["task_type"] == "quiz"
+        assert result["due_date"] is not None
+        assert result["due_date"].weekday() == 0  # Monday
+
+    def test_info_security_deterministic(self):
+        fields = _extract_deterministic_fields(
+            "information security quiz on Monday",
+            now=FIXED_NOW,
+            user_courses=["Information Security"],
+        )
+        assert fields["course"] == "Information Security"
+        assert fields["title"] == "Information Security Quiz"
+        assert fields["task_type"] == "quiz"

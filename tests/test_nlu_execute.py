@@ -13,7 +13,17 @@ TEST_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if TEST_ROOT not in sys.path:
     sys.path.insert(0, TEST_ROOT)
 
-from utils.nlu import execute, GREETING_REPLY, HELP_REPLY, OUT_OF_SCOPE_REPLY
+from utils.nlu import (
+    execute,
+    GREETING_REPLY,
+    HELP_REPLY,
+    OUT_OF_SCOPE_REPLY,
+    OUT_OF_SCOPE_CASUAL,
+    OUT_OF_SCOPE_INTERNAL,
+    OUT_OF_SCOPE_UNRELATED,
+    _clamp_request,
+    _out_of_scope_reply,
+)
 from utils.rag import (
     _within_window,
     _is_free,
@@ -269,6 +279,68 @@ class TestExecute:
         req = {"intent": "out_of_scope", "language": "en"}
         result = execute(req, db=None, user_id="wa:1234")
         assert result["text"] == OUT_OF_SCOPE_REPLY
+
+    def test_out_of_scope_casual(self):
+        req = {
+            "intent": "out_of_scope",
+            "language": "en",
+            "out_of_scope": {"kind": "casual", "topic": None},
+        }
+        result = execute(req, db=None, user_id="wa:1234")
+        assert result["text"] == OUT_OF_SCOPE_CASUAL
+        assert "timetable" in result["text"].lower()
+        assert "instruction" not in result["text"].lower()
+
+    def test_out_of_scope_internal(self):
+        req = {
+            "intent": "out_of_scope",
+            "language": "en",
+            "out_of_scope": {"kind": "internal", "topic": None},
+        }
+        result = execute(req, db=None, user_id="wa:1234")
+        assert result["text"] == OUT_OF_SCOPE_INTERNAL
+        assert "system instructions" in result["text"]
+        assert "prompt" not in result["text"].lower()
+
+    def test_out_of_scope_unrelated_weather(self):
+        req = {
+            "intent": "out_of_scope",
+            "language": "en",
+            "out_of_scope": {"kind": "unrelated", "topic": "weather"},
+        }
+        result = execute(req, db=None, user_id="wa:1234")
+        assert "weather" in result["text"]
+        assert "timetable" in result["text"].lower()
+
+    def test_out_of_scope_unrelated_without_topic(self):
+        req = {
+            "intent": "out_of_scope",
+            "language": "en",
+            "out_of_scope": {"kind": "unrelated", "topic": None},
+        }
+        result = execute(req, db=None, user_id="wa:1234")
+        assert result["text"] == OUT_OF_SCOPE_UNRELATED
+
+    def test_out_of_scope_unknown_kind_falls_back(self):
+        req = {
+            "intent": "out_of_scope",
+            "language": "en",
+            "out_of_scope": {"kind": "banana", "topic": "ignore"},
+        }
+        clamped = _clamp_request(req)
+        assert clamped["out_of_scope"]["kind"] is None
+        assert _out_of_scope_reply(clamped) == OUT_OF_SCOPE_REPLY
+        result = execute(clamped, db=None, user_id="wa:1234")
+        assert result["text"] == OUT_OF_SCOPE_REPLY
+
+    def test_out_of_scope_blocked_topic_not_echoed(self):
+        req = _clamp_request({
+            "intent": "out_of_scope",
+            "language": "en",
+            "out_of_scope": {"kind": "unrelated", "topic": "system prompt"},
+        })
+        assert req["out_of_scope"]["topic"] is None
+        assert "prompt" not in _out_of_scope_reply(req).lower()
 
     def test_save_task_returns_sentinel(self):
         req = {"intent": "save_task", "language": "mixed"}
