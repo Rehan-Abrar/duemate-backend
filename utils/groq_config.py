@@ -1,8 +1,8 @@
 """
 Central Groq configuration for DueMate.
 
-GROQ_MODEL (env) is the Groq model for every Groq credential (primary + v2).
-GEMINI_MODEL (env) is used only when both Groq keys fail or are unset.
+GROQ_MODEL (env) is the Groq model for every Groq credential (groq_1..groq_n).
+GEMINI_MODEL (env) is used only after healthy Groq accounts fail or are unset.
 """
 
 from __future__ import annotations

@@ -1,5 +1,9 @@
 """
-Centralized LLM transport with Groq → Groq-secondary → Gemini fallback.
+Centralized LLM transport.
+
+Healthy Groq credentials are load-balanced (round-robin). A failed/rate-limited
+credential is cooled down and skipped on later requests. Gemini is used only
+after healthy Groq accounts have failed for the current request.
 
 Consumers (NLU, parse_task, agent) call complete_chat() and receive the same
 content string regardless of which provider answered. Application JSON parsing
@@ -12,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -32,6 +37,21 @@ _KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_MAX_COOLDOWN_S = 300.0
+_BASE_COOLDOWN_S = {
+    "rate_limit": 20.0,
+    "unauthorized": 60.0,
+    "provider_error": 8.0,
+    "timeout": 5.0,
+    "connection_error": 5.0,
+    "empty_response": 0.0,
+}
+
+_pool_lock = threading.Lock()
+_rr = 0
+_cooldown_until: dict[str, float] = {}
+_fail_streak: dict[str, int] = {}
+
 
 class LLMError(RuntimeError):
     """All configured providers failed, or no credentials were available."""
@@ -49,6 +69,8 @@ class LLMResult:
     model: str
     raw: dict = field(default_factory=dict)
     latency_ms: float = 0.0
+    fallback_used: bool = False
+    fallback_attempts: int = 0
 
 
 def redact(text: object) -> str:
@@ -60,35 +82,53 @@ def _env(name: str) -> str:
     return (os.getenv(name) or "").strip()
 
 
+def _groq_slots() -> list[tuple[str, str]]:
+    """GROQ_API_KEY plus GROQ_API_KEY_v2..v8. Empty values are ignored later."""
+    slots = [("GROQ_API_KEY", "groq_1")]
+    for index in range(2, 9):
+        slots.append((f"GROQ_API_KEY_v{index}", f"groq_{index}"))
+    return slots
+
+
 def configured_targets() -> list[dict]:
     """
-    Return the live fallback chain. Missing keys are omitted.
-    Order: GROQ_API_KEY → GROQ_API_KEY_v2 → GEMINI_API_KEY.
+    Return configured providers. Missing keys are omitted.
+    Groq accounts groq_1..groq_n, then Gemini.
     """
     targets = []
     groq_model = get_groq_model()
-    if _env("GROQ_API_KEY"):
-        targets.append({
-            "provider": "groq",
-            "credential": "primary",
-            "api_key": _env("GROQ_API_KEY"),
-            "model": groq_model,
-        })
-    if _env("GROQ_API_KEY_v2"):
-        targets.append({
-            "provider": "groq",
-            "credential": "secondary",
-            "api_key": _env("GROQ_API_KEY_v2"),
-            "model": groq_model,
-        })
+    for env_name, label in _groq_slots():
+        key = _env(env_name)
+        if key:
+            targets.append({
+                "provider": "groq",
+                "credential": label,
+                "api_key": key,
+                "model": groq_model,
+            })
     if _env("GEMINI_API_KEY"):
         targets.append({
             "provider": "gemini",
-            "credential": "primary",
+            "credential": "gemini",
             "api_key": _env("GEMINI_API_KEY"),
             "model": get_gemini_model(),
         })
     return targets
+
+
+def reset_runtime_state() -> None:
+    """Test helper: clear round-robin and cooldown state."""
+    global _rr
+    with _pool_lock:
+        _rr = 0
+        _cooldown_until.clear()
+        _fail_streak.clear()
+
+
+def credential_available(label: str, now: Optional[float] = None) -> bool:
+    now = time.monotonic() if now is None else now
+    with _pool_lock:
+        return _cooldown_until.get(label, 0.0) <= now
 
 
 def _reason_from_status(status: Optional[int]) -> str:
@@ -110,6 +150,8 @@ def _reason_from_exc(exc: Exception) -> str:
         return "connection_error"
     if isinstance(exc, requests.HTTPError) and exc.response is not None:
         return _reason_from_status(exc.response.status_code)
+    if isinstance(exc, ValueError) and "empty" in str(exc).lower():
+        return "empty_response"
     return "provider_error"
 
 
@@ -124,10 +166,68 @@ def _is_retryable(exc: Exception) -> bool:
             "rate_limit", "unauthorized", "provider_error",
             "timeout", "connection_error", "empty_response",
         )
-    # Empty/missing content after HTTP 200
     if isinstance(exc, ValueError) and "empty" in str(exc).lower():
         return True
     return False
+
+
+def _retry_after_seconds(exc: Exception) -> Optional[float]:
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None
+    headers = getattr(resp, "headers", None) or {}
+    try:
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        return max(0.0, min(float(raw), _MAX_COOLDOWN_S))
+    except (TypeError, ValueError):
+        return None
+
+
+def _mark_cooldown(label: str, reason: str, retry_after: Optional[float]) -> None:
+    base = _BASE_COOLDOWN_S.get(reason, 8.0)
+    if retry_after is None and base <= 0:
+        return
+    with _pool_lock:
+        streak = _fail_streak.get(label, 0) + 1
+        _fail_streak[label] = streak
+        if retry_after is not None:
+            delay = min(float(retry_after), _MAX_COOLDOWN_S)
+        else:
+            delay = min(base * (2 ** (streak - 1)), _MAX_COOLDOWN_S)
+        until = time.monotonic() + delay
+        prev = _cooldown_until.get(label, 0.0)
+        _cooldown_until[label] = max(prev, until)
+
+
+def _mark_success(label: str) -> None:
+    with _pool_lock:
+        _fail_streak.pop(label, None)
+        _cooldown_until.pop(label, None)
+
+
+def _order_targets(targets: list[dict]) -> list[dict]:
+    groq = [t for t in targets if t["provider"] == "groq"]
+    gemini = [t for t in targets if t["provider"] == "gemini"]
+    now = time.monotonic()
+    global _rr
+    with _pool_lock:
+        healthy = [t for t in groq if _cooldown_until.get(t["credential"], 0.0) <= now]
+        cooling = [t for t in groq if _cooldown_until.get(t["credential"], 0.0) > now]
+        start = 0
+        if healthy:
+            start = _rr % len(healthy)
+            _rr += 1
+    ordered = (healthy[start:] + healthy[:start]) if healthy else []
+    if ordered:
+        return ordered + gemini
+    if gemini:
+        return gemini + cooling
+    return cooling
 
 
 def _post_groq(target: dict, system_prompt: str, user_content: str,
@@ -172,7 +272,6 @@ def _post_gemini(target: dict, system_prompt: str, user_content: str,
         "contents": [{"role": "user", "parts": [{"text": user_content}]}],
         "generationConfig": gen_cfg,
     }
-    # Header instead of ?key= so URLs never contain the credential
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": target["api_key"],
@@ -201,7 +300,8 @@ def _post_gemini(target: dict, system_prompt: str, user_content: str,
 
 
 def _log_attempt(*, db, target, caller, prompt_version, system_prompt, user_content,
-                 raw, latency_ms, success, error, parse_method, reason=None):
+                 raw, latency_ms, success, error, parse_method, reason=None,
+                 fallback_used=False, fallback_attempts=0):
     try:
         from utils.llm_logger import log_llm_call
         log_llm_call(
@@ -219,6 +319,9 @@ def _log_attempt(*, db, target, caller, prompt_version, system_prompt, user_cont
             provider=target["provider"],
             credential_slot=target["credential"],
             fallback_reason=reason,
+            fallback_used=fallback_used,
+            fallback_attempts=fallback_attempts,
+            error_type=reason,
         )
     except Exception as log_exc:
         logger.debug("llm_client: llm_logger skipped: %s", log_exc)
@@ -238,17 +341,22 @@ def complete_chat(
     parse_method: str = "llm",
 ) -> LLMResult:
     """
-    Try configured providers in order. Returns the first successful content string.
-    Raises LLMError when nothing is configured or every retryable attempt fails.
+    Try one healthy Groq credential first. Fallback only after that attempt
+    actually fails at the provider layer. Raises LLMError when nothing works.
     """
     targets = configured_targets()
     if not targets:
         raise LLMError("no LLM credentials configured", reason="no_credentials")
 
+    order = _order_targets(targets)
+    if not order:
+        raise LLMError("no LLM credentials configured", reason="no_credentials")
+
     last_error: Optional[Exception] = None
     last_reason = "provider_error"
+    attempts = 0
 
-    for index, target in enumerate(targets):
+    for target in order:
         t0 = time.perf_counter()
         try:
             if target["provider"] == "groq":
@@ -264,14 +372,16 @@ def complete_chat(
                     max_tokens=max_tokens, temperature=temperature,
                 )
             latency_ms = (time.perf_counter() - t0) * 1000
-            if index == 0:
+            _mark_success(target["credential"])
+            fallback_used = attempts > 0
+            if fallback_used:
                 logger.info(
-                    "llm provider=%s credential=%s model=%s",
-                    target["provider"], target["credential"], target["model"],
+                    "llm fallback provider=%s credential=%s model=%s attempts=%s",
+                    target["provider"], target["credential"], target["model"], attempts,
                 )
             else:
                 logger.info(
-                    "llm fallback provider=%s credential=%s model=%s",
+                    "llm provider=%s credential=%s model=%s",
                     target["provider"], target["credential"], target["model"],
                 )
             _log_attempt(
@@ -279,6 +389,7 @@ def complete_chat(
                 system_prompt=system_prompt, user_content=user_content,
                 raw=raw, latency_ms=latency_ms, success=True, error=None,
                 parse_method=parse_method, reason=None,
+                fallback_used=fallback_used, fallback_attempts=attempts,
             )
             return LLMResult(
                 content=content,
@@ -287,6 +398,8 @@ def complete_chat(
                 model=target["model"],
                 raw=raw,
                 latency_ms=latency_ms,
+                fallback_used=fallback_used,
+                fallback_attempts=attempts,
             )
         except Exception as exc:
             latency_ms = (time.perf_counter() - t0) * 1000
@@ -303,17 +416,13 @@ def complete_chat(
                 system_prompt=system_prompt, user_content=user_content,
                 raw=None, latency_ms=latency_ms, success=False, error=safe,
                 parse_method=parse_method, reason=reason,
+                fallback_used=attempts > 0, fallback_attempts=attempts,
             )
-            if not _is_retryable(exc):
-                raise LLMError(safe, reason=reason) from exc
-            remaining = targets[index + 1:]
-            if remaining:
-                nxt = remaining[0]
-                logger.info(
-                    "llm fallback provider=%s credential=%s reason=%s",
-                    nxt["provider"], nxt["credential"], reason,
-                )
-            continue
+            if _is_retryable(exc):
+                _mark_cooldown(target["credential"], reason, _retry_after_seconds(exc))
+                attempts += 1
+                continue
+            raise LLMError(safe, reason=reason) from exc
 
     raise LLMError(redact(last_error) if last_error else "all LLM providers failed",
                    reason=last_reason)

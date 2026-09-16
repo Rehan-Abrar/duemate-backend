@@ -10,6 +10,7 @@ since Render restarts are infrequent with keep-alive pings.
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from functools import wraps
@@ -120,6 +121,34 @@ class RateLimiter:
 
 # Global rate limiter instance
 _limiter = RateLimiter()
+
+
+def reset_rate_limiter() -> None:
+    """Test helper."""
+    with _limiter._lock:
+        _limiter._store.clear()
+
+
+def allow_ai_user(user_id: str, *, max_requests: Optional[int] = None) -> bool:
+    """
+    Per-user cap on WhatsApp/web AI messages.
+
+    Protects the shared Groq pool from one account flooding. Default is
+    generous for normal multi-turn clarification (not a UX throttle).
+    """
+    if not user_id:
+        return True
+    if max_requests is None:
+        raw = os.getenv("AI_RATE_LIMIT_PER_MINUTE") or os.getenv("RATE_LIMIT_PER_MINUTE") or "40"
+        try:
+            max_requests = int(raw)
+        except (TypeError, ValueError):
+            max_requests = 40
+    max_requests = max(5, min(int(max_requests), 300))
+    allowed, count, _retry = _limiter.is_allowed(f"ai:{user_id}", max_requests, 60)
+    if not allowed:
+        logger.warning("AI rate limit exceeded for user=%s count=%s/%s", user_id, count, max_requests)
+    return allowed
 
 
 def make_rate_limit_error_response(retry_after: int) -> tuple[Response, int]:

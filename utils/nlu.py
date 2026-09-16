@@ -164,6 +164,7 @@ def _call_groq(
     caller: str = "nlu",
     db=None,
     prompt_version: str = "nlu_v1",
+    max_tokens: int = 400,
 ) -> str:
     """LLM transport via the shared fallback client. Raises on total failure."""
     result = complete_chat(
@@ -171,7 +172,7 @@ def _call_groq(
         user_content,
         json_mode=json_mode,
         timeout=_nlu_timeout(),
-        max_tokens=500,
+        max_tokens=max_tokens,
         db=db,
         caller=caller,
         prompt_version=prompt_version,
@@ -1053,13 +1054,36 @@ def _handle_task_action(db, user_id, phone, text, request, session) -> dict:
     return {"action": "reply", "text": confirm_rescheduled(updated, due_date), "intent": "task_action"}
 
 
-def dispatch_message(db, user_id: str, phone: str, text: str) -> dict:
+def dispatch_message(db, user_id: str, phone: str, text: str, channel: str = None) -> dict:
     """
     Single AI entry point for WhatsApp and the web assistant.
 
     LLM #1 → execute/RAG → LLM #2 when routing is on; same fallback as WhatsApp
     when it is off or degraded. Never raises.
+
+    `channel` is observability-only (whatsapp|web). It is attached to the existing
+    llm_calls insert via context — no extra Mongo write on the user path.
     """
-    if routing_enabled():
-        return handle_message(db, user_id, phone, text)
-    return _fallback_handle(db, user_id, phone, text)
+    import uuid
+    from utils.llm_logger import llm_call_context
+    from utils.rate_limiter import allow_ai_user
+
+    if user_id and not allow_ai_user(user_id):
+        logger.warning("ai_rate_limited user=%s channel=%s", user_id, channel)
+        return {
+            "action": "reply",
+            "text": (
+                "You're sending messages a bit quickly. "
+                "Please wait a moment and try again."
+            ),
+            "intent": "rate_limited",
+        }
+
+    with llm_call_context(
+        user_id=user_id,
+        channel=channel,
+        request_id=str(uuid.uuid4()),
+    ):
+        if routing_enabled():
+            return handle_message(db, user_id, phone, text)
+        return _fallback_handle(db, user_id, phone, text)

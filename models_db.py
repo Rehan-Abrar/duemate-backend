@@ -119,6 +119,9 @@ def ensure_indexes() -> None:
     db.timetable_audit.create_index("at")
     db.timetable_audit.create_index("timetable_id")
 
+    from utils.ai_monitor import ensure_llm_calls_indexes
+    ensure_llm_calls_indexes(db)
+
     _indexes_ready = True
     logger.info("MongoDB indexes created successfully")
 

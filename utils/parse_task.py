@@ -981,7 +981,7 @@ def _parse_with_groq(
         f"Parse this message:\n\n{message_text}",
         json_mode=True,
         timeout=15,
-        max_tokens=500,
+        max_tokens=350,
         db=db,
         caller="_parse_with_groq",
         prompt_version="parse_task_v2",

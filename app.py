@@ -1089,6 +1089,8 @@ def ensure_mongo_indexes() -> None:
     ensure_conversation_index(db)
     from utils.nlu_session import ensure_nlu_session_index
     ensure_nlu_session_index(db)
+    from utils.ai_monitor import ensure_llm_calls_indexes
+    ensure_llm_calls_indexes(db)
     # User timetables — one document per user, stores ALL parsed sections
     db.user_timetables.create_index("user_id", unique=True)
     # Official (admin-managed) timetables — versioned, section-indexed
@@ -1313,7 +1315,8 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                 from utils.nlu import dispatch_message as _dispatch_message  # type: ignore
                 try:
                     _nlu_result = _dispatch_message(
-                        db, user_id, normalized_sender or sender, text_body
+                        db, user_id, normalized_sender or sender, text_body,
+                        channel="whatsapp",
                     )
                 except Exception as _nlu_err:
                     app.logger.warning(
@@ -2251,6 +2254,83 @@ def create_app() -> Flask:
             })
         except Exception as exc:
             app.logger.exception("admin_user_detail_failed user_id=%s error=%s", user_id, str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    def _ai_monitor_day(raw: str, *, end_of_day: bool = False) -> Optional[datetime]:
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        if len(raw) <= 10:
+            try:
+                local = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=_PKT)
+            except ValueError:
+                return _parse_query_datetime(raw, end_of_day=end_of_day)
+            if end_of_day:
+                local = local.replace(hour=23, minute=59, second=59, microsecond=999000)
+            return local.astimezone(timezone.utc)
+        return _parse_query_datetime(raw, end_of_day=end_of_day)
+
+    def _ai_monitor_range():
+        since = _ai_monitor_day(request.args.get("since", ""))
+        until = _ai_monitor_day(request.args.get("until", ""), end_of_day=True)
+        if since is None and until is None:
+            since = _pkt_today_start_utc()
+        return since, until
+
+    @app.get("/api/admin/ai/summary")
+    @admin_auth_required
+    def admin_ai_summary():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        try:
+            ensure_mongo_indexes()
+            from utils.ai_monitor import build_match, summarize
+            since, until = _ai_monitor_range()
+            match = build_match(request.args, since=since, until=until, db=db)
+            body = summarize(db, match)
+            body["since"] = _serialize_for_json(since)
+            body["until"] = _serialize_for_json(until)
+            return jsonify(body)
+        except Exception as exc:
+            app.logger.exception("admin_ai_summary_failed error=%s", str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    @app.get("/api/admin/ai/calls")
+    @admin_auth_required
+    def admin_ai_calls():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        page, limit = _page_args(default_limit=20, max_limit=100)
+        try:
+            ensure_mongo_indexes()
+            from utils.ai_monitor import build_match, list_calls
+            since, until = _ai_monitor_range()
+            match = build_match(request.args, since=since, until=until, db=db)
+            body = list_calls(db, match, page=page, limit=limit)
+            body["since"] = _serialize_for_json(since)
+            body["until"] = _serialize_for_json(until)
+            return jsonify(_serialize_for_json(body))
+        except Exception as exc:
+            app.logger.exception("admin_ai_calls_failed error=%s", str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    @app.get("/api/admin/ai/calls/<call_id>")
+    @admin_auth_required
+    def admin_ai_call_detail(call_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        try:
+            ensure_mongo_indexes()
+            from utils.ai_monitor import get_call
+            item = get_call(db, call_id)
+            if not item:
+                return jsonify({"error": "not_found"}), 404
+            return jsonify(_serialize_for_json(item))
+        except Exception as exc:
+            app.logger.exception("admin_ai_call_detail_failed call_id=%s error=%s", call_id, str(exc))
             return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
 
     @app.get("/api/delivery-status")
@@ -3613,7 +3693,7 @@ def create_app() -> Flask:
 
         from utils.nlu import dispatch_message as _dispatch_message  # type: ignore
         try:
-            result = _dispatch_message(db, user_id, phone, message)
+            result = _dispatch_message(db, user_id, phone, message, channel="web")
         except Exception as _nlu_err:
             app.logger.warning("assistant_chat nlu_failed err=%s", _nlu_err)
             result = {"action": "save_task", "intent": "save_task"}
