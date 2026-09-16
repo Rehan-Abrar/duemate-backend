@@ -110,6 +110,315 @@ def _enrich_messages_with_contact_names(db, messages: list) -> list:
     return messages
 
 
+_INBOX_RECENT_DAYS = 7
+_PKT = timezone(timedelta(hours=5))
+
+
+def _page_args(default_limit: int = 20, max_limit: int = 50) -> tuple[int, int]:
+    try:
+        page = int(request.args.get("page", "1"))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        limit = int(request.args.get("limit", str(default_limit)))
+    except (TypeError, ValueError):
+        limit = default_limit
+    return max(1, page), max(1, min(limit, max_limit))
+
+
+def _contact_search_filter(q: str) -> dict:
+    q = (q or "").strip()
+    if not q:
+        return {}
+    clauses = [
+        {"profile_name": {"$regex": re.escape(q), "$options": "i"}},
+        {"wa_id": {"$regex": re.escape(q)}},
+    ]
+    digits = "".join(ch for ch in q if ch.isdigit())
+    if digits and digits != q:
+        clauses.append({"wa_id": {"$regex": re.escape(digits)}})
+    return {"$or": clauses}
+
+
+def _parse_query_datetime(raw: str, *, end_of_day: bool = False) -> Optional[datetime]:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    parsed = _parse_due_date_value(raw)
+    if parsed is None:
+        return None
+    if end_of_day and len(raw) <= 10:
+        parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999000)
+    return parsed
+
+
+def _pkt_today_start_utc() -> datetime:
+    now = datetime.now(_PKT)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.astimezone(timezone.utc)
+
+
+def _public_profile_name(raw) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    name = raw.strip()
+    return name or None
+
+
+def _batch_message_stats(db, wa_ids: list) -> dict:
+    """One aggregation: message_count + latest text/time per sender. No N+1."""
+    if not wa_ids:
+        return {}
+    pipeline = [
+        {"$match": {"from": {"$in": list(wa_ids)}}},
+        {"$sort": {"received_at": -1}},
+        {"$group": {
+            "_id": "$from",
+            "message_count": {"$sum": 1},
+            "latest_text": {"$first": "$text"},
+            "latest_at": {"$first": "$received_at"},
+        }},
+    ]
+    stats = {}
+    for row in db.messages.aggregate(pipeline):
+        stats[row.get("_id")] = {
+            "message_count": int(row.get("message_count") or 0),
+            "latest_text": row.get("latest_text") or "",
+            "latest_at": row.get("latest_at"),
+        }
+    return stats
+
+
+def _serialize_contact_row(contact: dict, stats: dict) -> dict:
+    wa_id = contact.get("wa_id") or ""
+    info = stats.get(wa_id) or {}
+    return {
+        "wa_id": wa_id,
+        "profile_name": _public_profile_name(contact.get("profile_name")),
+        "last_seen": _serialize_for_json(contact.get("last_seen")),
+        "updated_at": _serialize_for_json(contact.get("updated_at")),
+        "message_count": int(info.get("message_count") or 0),
+        "latest_text": info.get("latest_text") or "",
+        "latest_at": _serialize_for_json(info.get("latest_at")),
+    }
+
+
+def _serialize_inbox_message(doc: dict) -> dict:
+    return {
+        "message_id": doc.get("message_id"),
+        "from": doc.get("from"),
+        "from_name": doc.get("from_name"),
+        "to": doc.get("to"),
+        "text": doc.get("text"),
+        "type": doc.get("type"),
+        "timestamp": _serialize_for_json(doc.get("timestamp")),
+        "received_at": _serialize_for_json(doc.get("received_at")),
+        "delivery_status": doc.get("delivery_status"),
+    }
+
+
+_ADMIN_SAFE_SETTINGS = frozenset({
+    "timezone",
+    "reminder_enabled",
+    "notification_preference",
+    "whatsapp_reminders_enabled",
+    "reminder_hours_before",
+    "university_id",
+    "academic_term",
+    "program",
+    "semester",
+    "timetable_section",
+    "available_sections",
+    "course_aliases",
+})
+_VALID_USER_SORTS = frozenset({"last_seen", "newest", "oldest"})
+_OFFICIAL_SETTINGS_QUERY = {
+    "settings.university_id": {"$exists": True, "$nin": [None, ""]},
+    "settings.timetable_section": {"$exists": True, "$nin": [None, ""]},
+}
+
+
+def _student_users_query() -> dict:
+    return {"user_id": {"$not": {"$regex": r"^admin:"}}}
+
+
+def _user_wa_id(user: dict) -> str:
+    phone = str(user.get("phone_number") or "").strip()
+    if phone:
+        return phone
+    uid = str(user.get("user_id") or "")
+    if uid.startswith("wa:"):
+        return uid[3:]
+    return ""
+
+
+def _safe_settings(settings) -> dict:
+    if not isinstance(settings, dict):
+        return {}
+    return {
+        key: _serialize_for_json(settings[key])
+        for key in _ADMIN_SAFE_SETTINGS
+        if key in settings
+    }
+
+
+def _setting_text(settings: dict, key: str):
+    value = (settings or {}).get(key)
+    if value is None or value == "":
+        return None
+    return value
+
+
+def _official_user(user: dict) -> bool:
+    settings = user.get("settings") or {}
+    uni = str(settings.get("university_id") or "").strip()
+    section = str(settings.get("timetable_section") or "").strip()
+    return bool(uni and section)
+
+
+def _timetable_source(user: dict, self_upload_ids: set) -> str:
+    if _official_user(user):
+        return "official"
+    if user.get("user_id") in self_upload_ids:
+        return "self_upload"
+    return "none"
+
+
+def _self_upload_user_ids(db) -> set:
+    return set(db.user_timetables.distinct("user_id") or [])
+
+
+def _batch_contact_names(db, wa_ids: list) -> dict:
+    if not wa_ids:
+        return {}
+    names = {}
+    for contact in db.contacts.find(
+        {"wa_id": {"$in": list(wa_ids)}},
+        {"wa_id": 1, "profile_name": 1, "last_seen": 1, "_id": 0},
+    ):
+        wa_id = contact.get("wa_id")
+        if wa_id:
+            names[wa_id] = {
+                "profile_name": _public_profile_name(contact.get("profile_name")),
+                "last_seen": contact.get("last_seen"),
+                "wa_id": wa_id,
+            }
+    return names
+
+
+def _batch_task_counts(db, user_ids: list) -> dict:
+    if not user_ids:
+        return {}
+    counts = {}
+    for row in db.tasks.aggregate([
+        {"$match": {"user_id": {"$in": list(user_ids)}}},
+        {"$group": {"_id": "$user_id", "count": {"$sum": 1}}},
+    ]):
+        counts[row.get("_id")] = int(row.get("count") or 0)
+    return counts
+
+
+def _user_search_clause(db, q: str) -> Optional[dict]:
+    q = (q or "").strip()
+    if not q:
+        return None
+    escaped = re.escape(q)
+    clauses = [
+        {"phone_number": {"$regex": escaped}},
+        {"user_id": {"$regex": escaped, "$options": "i"}},
+    ]
+    digits = "".join(ch for ch in q if ch.isdigit())
+    if digits:
+        clauses.append({"phone_number": {"$regex": re.escape(digits)}})
+        clauses.append({"user_id": {"$regex": re.escape(f"wa:{digits}"), "$options": "i"}})
+    name_hits = list(db.contacts.find(
+        {"profile_name": {"$regex": escaped, "$options": "i"}},
+        {"wa_id": 1, "_id": 0},
+    ))
+    wa_ids = [row.get("wa_id") for row in name_hits if row.get("wa_id")]
+    if wa_ids:
+        clauses.append({"phone_number": {"$in": wa_ids}})
+        clauses.append({"user_id": {"$in": [f"wa:{wa}" for wa in wa_ids]}})
+    return {"$or": clauses}
+
+
+def _admin_users_query(db) -> dict:
+    query: dict = dict(_student_users_query())
+    clauses = [query]
+    search = _user_search_clause(db, request.args.get("q", ""))
+    if search:
+        clauses.append(search)
+
+    university = (request.args.get("university") or "").strip()
+    if university:
+        clauses.append({"settings.university_id": university})
+    program = (request.args.get("program") or "").strip()
+    if program:
+        clauses.append({"settings.program": program})
+    semester_raw = (request.args.get("semester") or "").strip()
+    if semester_raw:
+        semester_clause: dict = {"settings.semester": semester_raw}
+        if semester_raw.isdigit():
+            semester_clause = {"$or": [
+                {"settings.semester": int(semester_raw)},
+                {"settings.semester": semester_raw},
+            ]}
+        clauses.append(semester_clause)
+    section = (request.args.get("section") or "").strip()
+    if section:
+        clauses.append({"settings.timetable_section": section})
+
+    source = (request.args.get("timetable_source") or "").strip().lower()
+    if source in {"official", "self_upload", "none"}:
+        self_ids = _self_upload_user_ids(db)
+        if source == "official":
+            clauses.append(dict(_OFFICIAL_SETTINGS_QUERY))
+        elif source == "self_upload":
+            clauses.append({"user_id": {"$in": list(self_ids) or ["__none__"]}})
+            clauses.append({"$nor": [dict(_OFFICIAL_SETTINGS_QUERY)]})
+        else:
+            clauses.append({"user_id": {"$nin": list(self_ids)}})
+            clauses.append({"$nor": [dict(_OFFICIAL_SETTINGS_QUERY)]})
+
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+def _users_sort():
+    sort = (request.args.get("sort") or "last_seen").strip().lower()
+    if sort not in _VALID_USER_SORTS:
+        sort = "last_seen"
+    if sort == "newest":
+        return [("created_at", -1), ("user_id", 1)], sort
+    if sort == "oldest":
+        return [("created_at", 1), ("user_id", 1)], sort
+    return [("last_seen", -1), ("created_at", -1)], sort
+
+
+def _serialize_admin_user_row(user: dict, contacts: dict, message_stats: dict, task_counts: dict, self_ids: set) -> dict:
+    settings = user.get("settings") or {}
+    wa_id = _user_wa_id(user)
+    contact = contacts.get(wa_id) or {}
+    return {
+        "user_id": user.get("user_id"),
+        "phone_number": user.get("phone_number") or None,
+        "wa_id": wa_id or None,
+        "profile_name": contact.get("profile_name"),
+        "university": _setting_text(settings, "university_id"),
+        "program": _setting_text(settings, "program"),
+        "semester": settings.get("semester") if settings.get("semester") not in (None, "") else None,
+        "section": _setting_text(settings, "timetable_section"),
+        "academic_term": _setting_text(settings, "academic_term"),
+        "timetable_source": _timetable_source(user, self_ids),
+        "last_seen": _serialize_for_json(user.get("last_seen")),
+        "created_at": _serialize_for_json(user.get("created_at")),
+        "updated_at": _serialize_for_json(user.get("updated_at")),
+        "message_count": int((message_stats.get(wa_id) or {}).get("message_count") or 0),
+        "task_count": int(task_counts.get(user.get("user_id")) or 0),
+    }
+
+
 def _parse_object_id(value: str) -> Optional[ObjectId]:
     try:
         return ObjectId(value)
@@ -645,10 +954,13 @@ def ensure_mongo_indexes() -> None:
     db.messages.create_index("message_id", unique=True)
     db.messages.create_index("received_at")
     db.messages.create_index("from")
+    db.messages.create_index([("from", 1), ("received_at", -1)])
     db.contacts.create_index("wa_id", unique=True)
     db.users.create_index("user_id", unique=True)
     db.users.create_index("phone_number", unique=True)
     db.users.create_index("password_set")
+    db.users.create_index("last_seen")
+    db.users.create_index("created_at")
     db.user_sessions.create_index("token_hash", unique=True)
     db.user_sessions.create_index("user_id")
     db.user_sessions.create_index("expires_at")
@@ -1748,6 +2060,265 @@ def create_app() -> Flask:
             return jsonify({"items": items, "count": len(items)})
         except Exception as exc:
             app.logger.exception("recent_messages_failed error=%s", str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    @app.get("/api/admin/inbox/summary")
+    @admin_auth_required
+    def admin_inbox_summary():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        try:
+            ensure_mongo_indexes()
+            recent_since = _utc_now() - timedelta(days=_INBOX_RECENT_DAYS)
+            today_start = _pkt_today_start_utc()
+            return jsonify({
+                "total_contacts": db.contacts.count_documents({}),
+                "total_messages": db.messages.count_documents({}),
+                "recent_contacts": db.contacts.count_documents({
+                    "last_seen": {"$gte": recent_since},
+                }),
+                "messages_today": db.messages.count_documents({
+                    "received_at": {"$gte": today_start},
+                }),
+                "recent_days": _INBOX_RECENT_DAYS,
+            })
+        except Exception as exc:
+            app.logger.exception("admin_inbox_summary_failed error=%s", str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    @app.get("/api/admin/inbox/contacts")
+    @admin_auth_required
+    def admin_inbox_contacts():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        page, limit = _page_args(default_limit=20, max_limit=100)
+        query = _contact_search_filter(request.args.get("q", ""))
+        try:
+            ensure_mongo_indexes()
+            total = db.contacts.count_documents(query)
+            cursor = (
+                db.contacts.find(query, {"_id": 0})
+                .sort([("last_seen", -1), ("profile_name", 1)])
+                .skip((page - 1) * limit)
+                .limit(limit)
+            )
+            rows = list(cursor)
+            stats = _batch_message_stats(db, [row.get("wa_id") for row in rows if row.get("wa_id")])
+            items = [_serialize_contact_row(row, stats) for row in rows]
+            pages = (total + limit - 1) // limit if total else 0
+            return jsonify({
+                "items": items,
+                "count": total,
+                "page": page,
+                "limit": limit,
+                "pages": pages,
+            })
+        except Exception as exc:
+            app.logger.exception("admin_inbox_contacts_failed error=%s", str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    @app.get("/api/admin/inbox/contacts/<wa_id>/messages")
+    @admin_auth_required
+    def admin_inbox_contact_messages(wa_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        wa_id = (wa_id or "").strip()
+        if not wa_id:
+            return jsonify({"error": "wa_id_required"}), 400
+
+        page, limit = _page_args(default_limit=30, max_limit=50)
+        sort_dir = -1 if (request.args.get("sort", "newest") or "").lower() != "oldest" else 1
+        query: dict = {"from": wa_id}
+        text_q = (request.args.get("q") or "").strip()
+        if text_q:
+            query["text"] = {"$regex": re.escape(text_q), "$options": "i"}
+        since = _parse_query_datetime(request.args.get("since", ""))
+        until = _parse_query_datetime(request.args.get("until", ""), end_of_day=True)
+        if since or until:
+            received: dict = {}
+            if since:
+                received["$gte"] = since
+            if until:
+                received["$lte"] = until
+            query["received_at"] = received
+
+        try:
+            ensure_mongo_indexes()
+            contact = db.contacts.find_one({"wa_id": wa_id}, {"_id": 0}) or {}
+            total = db.messages.count_documents(query)
+            cursor = (
+                db.messages.find(query, {"_id": 0, "raw": 0})
+                .sort("received_at", sort_dir)
+                .skip((page - 1) * limit)
+                .limit(limit)
+            )
+            items = _enrich_messages_with_contact_names(db, list(cursor))
+            pages = (total + limit - 1) // limit if total else 0
+            profile_name = _public_profile_name(contact.get("profile_name"))
+            return jsonify({
+                "contact": {
+                    "wa_id": wa_id,
+                    "profile_name": profile_name,
+                    "last_seen": _serialize_for_json(contact.get("last_seen")),
+                    "updated_at": _serialize_for_json(contact.get("updated_at")),
+                    "message_count": db.messages.count_documents({"from": wa_id}),
+                },
+                "items": [_serialize_inbox_message(doc) for doc in items],
+                "count": total,
+                "page": page,
+                "limit": limit,
+                "pages": pages,
+            })
+        except Exception as exc:
+            app.logger.exception("admin_inbox_contact_messages_failed wa_id=%s error=%s", wa_id, str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    @app.get("/api/admin/users/summary")
+    @admin_auth_required
+    def admin_users_summary():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        try:
+            ensure_mongo_indexes()
+            base = _student_users_query()
+            recent_since = _utc_now() - timedelta(days=_INBOX_RECENT_DAYS)
+            official_q = {"$and": [base, dict(_OFFICIAL_SETTINGS_QUERY)]}
+            official = db.users.count_documents(official_q)
+            self_ids = _self_upload_user_ids(db)
+            self_upload = db.users.count_documents({
+                "$and": [
+                    base,
+                    {"user_id": {"$in": list(self_ids) or ["__none__"]}},
+                    {"$nor": [dict(_OFFICIAL_SETTINGS_QUERY)]},
+                ]
+            }) if self_ids else 0
+            total = db.users.count_documents(base)
+            return jsonify({
+                "total_users": total,
+                "active_users": db.users.count_documents({
+                    **base,
+                    "last_seen": {"$gte": recent_since},
+                }),
+                "official_timetable": official,
+                "self_uploaded_timetable": self_upload,
+                "no_timetable": max(0, total - official - self_upload),
+                "recent_days": _INBOX_RECENT_DAYS,
+            })
+        except Exception as exc:
+            app.logger.exception("admin_users_summary_failed error=%s", str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    @app.get("/api/admin/users")
+    @admin_auth_required
+    def admin_users_list():
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        page, limit = _page_args(default_limit=20, max_limit=100)
+        try:
+            ensure_mongo_indexes()
+            query = _admin_users_query(db)
+            sort_spec, sort = _users_sort()
+            total = db.users.count_documents(query)
+            rows = list(
+                db.users.find(query, {"password_hash": 0, "password": 0})
+                .sort(sort_spec)
+                .skip((page - 1) * limit)
+                .limit(limit)
+            )
+            self_ids = _self_upload_user_ids(db)
+            wa_ids = [_user_wa_id(row) for row in rows if _user_wa_id(row)]
+            user_ids = [row.get("user_id") for row in rows if row.get("user_id")]
+            contacts = _batch_contact_names(db, wa_ids)
+            message_stats = _batch_message_stats(db, wa_ids)
+            task_counts = _batch_task_counts(db, user_ids)
+            items = [
+                _serialize_admin_user_row(row, contacts, message_stats, task_counts, self_ids)
+                for row in rows
+            ]
+            pages = (total + limit - 1) // limit if total else 0
+            return jsonify({
+                "items": items,
+                "count": total,
+                "page": page,
+                "limit": limit,
+                "pages": pages,
+                "sort": sort,
+            })
+        except Exception as exc:
+            app.logger.exception("admin_users_list_failed error=%s", str(exc))
+            return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
+
+    @app.get("/api/admin/users/<path:user_id>")
+    @admin_auth_required
+    def admin_user_detail(user_id: str):
+        db = get_mongo_db()
+        if db is None:
+            return jsonify({"error": "database_not_configured"}), 503
+        user_id = (user_id or "").strip()
+        if not user_id or user_id.startswith("admin:"):
+            return jsonify({"error": "not_found"}), 404
+        try:
+            ensure_mongo_indexes()
+            user = db.users.find_one(
+                {"user_id": user_id},
+                {"password_hash": 0, "password": 0},
+            )
+            if not user:
+                return jsonify({"error": "not_found"}), 404
+            self_ids = _self_upload_user_ids(db)
+            wa_id = _user_wa_id(user)
+            contacts = _batch_contact_names(db, [wa_id] if wa_id else [])
+            message_stats = _batch_message_stats(db, [wa_id] if wa_id else [])
+            task_counts = _batch_task_counts(db, [user_id])
+            row = _serialize_admin_user_row(user, contacts, message_stats, task_counts, self_ids)
+            academic = get_user_academic_context(db, user_id)
+            recent_tasks = []
+            for task in db.tasks.find(
+                {"user_id": user_id},
+                {
+                    "_id": 1,
+                    "parsed_title": 1,
+                    "parsed_course": 1,
+                    "parsed_due_date": 1,
+                    "task_type": 1,
+                    "status": 1,
+                },
+            ).sort("created_at", -1).limit(8):
+                recent_tasks.append({
+                    "id": str(task.get("_id")),
+                    "title": task.get("parsed_title"),
+                    "course": task.get("parsed_course"),
+                    "due_date": _serialize_for_json(task.get("parsed_due_date")),
+                    "task_type": task.get("task_type"),
+                    "status": task.get("status"),
+                })
+            contact = contacts.get(wa_id) or {}
+            return jsonify({
+                **row,
+                "settings": _safe_settings(user.get("settings") or {}),
+                "contact": {
+                    "wa_id": wa_id or None,
+                    "profile_name": contact.get("profile_name"),
+                    "last_seen": _serialize_for_json(contact.get("last_seen")),
+                    "linked": bool(contact),
+                },
+                "timetable": {
+                    "source": academic.get("source"),
+                    "section": academic.get("section"),
+                    "academic_term": academic.get("academic_term"),
+                    "version": academic.get("timetable_version"),
+                    "has_timetable": bool(academic.get("has_timetable")),
+                    "status": academic.get("status"),
+                },
+                "recent_tasks": recent_tasks,
+            })
+        except Exception as exc:
+            app.logger.exception("admin_user_detail_failed user_id=%s error=%s", user_id, str(exc))
             return jsonify({"error": "database_unavailable", "detail": exc.__class__.__name__}), 503
 
     @app.get("/api/delivery-status")
