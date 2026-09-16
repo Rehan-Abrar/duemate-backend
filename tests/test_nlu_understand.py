@@ -71,7 +71,45 @@ class TestClampRequest:
         result = _clamp_request(raw)
         assert result["intent"] == "schedule_query"
         assert result["schedule"]["query_type"] == "next_class"
+        assert result["schedule"]["section"] is None
         assert result["confidence"] == 0.95
+
+    def test_section_normalized_from_spaced_label(self):
+        raw = {
+            "intent": "schedule_query",
+            "language": "en",
+            "confidence": 0.9,
+            "schedule": {
+                "query_type": "full_timetable",
+                "section": "BSCS 7B",
+            },
+        }
+        result = _clamp_request(raw)
+        assert result["schedule"]["section"] == "BSCS-7B"
+
+    def test_section_promoted_from_course_field(self):
+        raw = {
+            "intent": "schedule_query",
+            "language": "mixed",
+            "confidence": 0.9,
+            "schedule": {
+                "query_type": "full_timetable",
+                "course": "BSCS-7A",
+            },
+        }
+        result = _clamp_request(raw)
+        assert result["schedule"]["section"] == "BSCS-7A"
+        assert result["schedule"]["course"] is None
+
+    def test_garbage_section_rejected(self):
+        raw = {
+            "intent": "schedule_query",
+            "language": "en",
+            "confidence": 0.8,
+            "schedule": {"query_type": "full_timetable", "section": "tomorrow"},
+        }
+        result = _clamp_request(raw)
+        assert result["schedule"]["section"] is None
 
     def test_unknown_intent_clamped_to_out_of_scope(self):
         raw = {"intent": "banana", "language": "en", "confidence": 0.5}
@@ -311,11 +349,15 @@ class TestUnderstand:
         import requests as req
         monkeypatch.setattr(req, "post", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("network error")))
         monkeypatch.setenv("GROQ_API_KEY", "test-key")
+        monkeypatch.delenv("GROQ_API_KEY_v2", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
         result = understand("when is my next class?")
         assert result["intent"] == "_degraded"
 
     def test_no_api_key_returns_degraded(self, monkeypatch):
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("GROQ_API_KEY_v2", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
         result = understand("when is my next class?")
         assert result["intent"] == "_degraded"
 

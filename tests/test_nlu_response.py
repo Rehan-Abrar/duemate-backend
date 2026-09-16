@@ -54,6 +54,18 @@ class TestContainmentGuard:
         llm = "CN 2:00 PM Lab 1 hai."
         assert _containment_guard(llm, det) is True
 
+    def test_invented_ellipsis_rejected(self):
+        det = (
+            "Next class:\nComputer Vision Lab\nThursday, 2:00 PM - 5:00 PM\n"
+            "Room: Computer Lab 1\nInstructor information isn't available for this class."
+        )
+        assert _containment_guard("Instructor: … 😄", det) is False
+        assert _containment_guard("Instructor: ... ", det) is False
+
+    def test_ellipsis_already_in_source_accepted(self):
+        det = "Nothing else for today…"
+        assert _containment_guard("Bas itna hi…", det) is True
+
 
 # ── respond() — flag disabled ─────────────────────────────────────────────────
 

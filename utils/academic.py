@@ -36,6 +36,7 @@ STATUS_NO_DB = "no_db"
 STATUS_NO_TIMETABLE = "no_timetable"
 STATUS_NO_SECTION = "no_section"
 STATUS_EMPTY = "empty"
+STATUS_UNKNOWN_SECTION = "unknown_section"
 
 # Generic English structure words used only for tokenising course titles.
 # These are NOT academic facts (no course/teacher/section names live here), so they
@@ -161,6 +162,71 @@ def _empty_context(status: str, overrides: dict, section: Optional[str] = None) 
     }
 
 
+def normalize_requested_section(raw: Optional[str]) -> Optional[str]:
+    """
+    Turn free text into a canonical section label using the PDF parser's
+    section matcher (BSCS-7A, 'BSCS 7B', BSSE-7C, …). Returns None when the
+    text does not contain a section token. Not a default-section fallback.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    from utils.timetable_universal import _extract_sections_from_text, _norm_section
+
+    found = list(dict.fromkeys(_extract_sections_from_text(text)))
+    if found:
+        return found[0]
+    normalized = _norm_section(text)
+    if re.fullmatch(
+        r"(BSCS|BSSE|BSDS|BSIT|BSAI|BSCY|BSCGV|BSCOMP)-\d+[A-Z]?",
+        normalized,
+        re.I,
+    ):
+        return normalized
+    return None
+
+
+def get_published_section_context(db, section: str) -> dict:
+    """
+    Public official-only lookup for an explicit section label.
+
+    Reads official_timetables only. Never reads users.settings, user_timetables,
+    tasks, or any default section.
+    """
+    normalized = normalize_requested_section(section)
+    if db is None:
+        return _empty_context(STATUS_NO_DB, {}, section=normalized)
+    if not normalized:
+        return _empty_context(STATUS_UNKNOWN_SECTION, {}, section=None)
+
+    now = _utc_now()
+    doc = db.official_timetables.find_one(
+        {
+            "status": "published",
+            "detected_sections": normalized,
+            "effective_from": {"$lte": now},
+            "$or": [{"effective_to": None}, {"effective_to": {"$gt": now}}],
+        },
+        sort=[("effective_from", -1), ("version", -1)],
+    )
+    if not doc:
+        return _empty_context(STATUS_UNKNOWN_SECTION, {}, section=normalized)
+    slots = (doc.get("sections") or {}).get(normalized, [])
+    if not slots:
+        return _empty_context(STATUS_UNKNOWN_SECTION, {}, section=normalized)
+    return _build_context(
+        STATUS_OK,
+        "official",
+        normalized,
+        slots,
+        doc.get("academic_term"),
+        doc.get("version"),
+        {},
+    )
+
+
 def load_course_overrides(db, user_id: str) -> dict:
     """Optional per-user slang map: users.settings.course_aliases = {alias: canonical}."""
     if db is None or not user_id:
@@ -267,7 +333,11 @@ NO_TIMETABLE_MESSAGES = {
 }
 
 
-def message_for_status(status: str) -> str:
+def message_for_status(status: str, section: Optional[str] = None) -> str:
+    if status == STATUS_UNKNOWN_SECTION:
+        if section:
+            return f"I couldn't find a published timetable for {section}."
+        return "I couldn't find a published timetable for that section."
     return NO_TIMETABLE_MESSAGES.get(
         status, "I don't have your timetable yet. Please set it up from the dashboard."
     )

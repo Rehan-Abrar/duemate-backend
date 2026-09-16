@@ -6,7 +6,7 @@ TEST_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if TEST_ROOT not in sys.path:
     sys.path.insert(0, TEST_ROOT)
 
-from utils.groq_config import DEFAULT_GROQ_MODEL, get_groq_model
+from utils.groq_config import DEFAULT_GEMINI_MODEL, DEFAULT_GROQ_MODEL, get_gemini_model, get_groq_model
 
 
 class TestGroqModelConfig:
@@ -22,6 +22,11 @@ class TestGroqModelConfig:
     def test_blank_env_falls_back(self, monkeypatch):
         monkeypatch.setenv("GROQ_MODEL", "   ")
         assert get_groq_model() == "openai/gpt-oss-20b"
+
+    def test_gemini_default_is_flash_lite(self, monkeypatch):
+        monkeypatch.delenv("GEMINI_MODEL", raising=False)
+        assert DEFAULT_GEMINI_MODEL == "gemini-2.5-flash-lite"
+        assert get_gemini_model() == "gemini-2.5-flash-lite"
 
     def test_callers_use_central_helper(self, monkeypatch):
         monkeypatch.setenv("GROQ_MODEL", "central-test-model")

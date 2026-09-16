@@ -8,6 +8,9 @@ Schema of each document:
     {
         "call_id":       str,          # unique UUID
         "model":         str,          # e.g. "openai/gpt-oss-20b"
+        "provider":      str,          # "groq" | "gemini"
+        "credential_slot": str,        # "primary" | "secondary" — never the key
+        "fallback_reason": str | None, # why this attempt ran / failed
         "prompt_version": str,         # e.g. "parse_task_v2"
         "caller":        str,          # which function triggered this call
         "input_tokens":  int,
@@ -46,6 +49,16 @@ def _hash_prompt(text: str) -> str:
     return hashlib.md5(text.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
 
 
+def _redact_error(error: Optional[str]) -> Optional[str]:
+    if error is None:
+        return None
+    try:
+        from utils.llm_client import redact
+        return redact(error)
+    except Exception:
+        return error
+
+
 def log_llm_call(
     *,
     db,
@@ -60,6 +73,9 @@ def log_llm_call(
     parse_method: str = "groq",
     success: bool = True,
     error: Optional[str] = None,
+    provider: Optional[str] = None,
+    credential_slot: Optional[str] = None,
+    fallback_reason: Optional[str] = None,
 ) -> None:
     """
     Persist one LLM call record.  Safe to call even if db is None.
@@ -84,7 +100,10 @@ def log_llm_call(
         "confidence": round(confidence, 3) if confidence is not None else None,
         "parse_method": parse_method,
         "success": success,
-        "error": error,
+        "error": _redact_error(error),
+        "provider": provider,
+        "credential_slot": credential_slot,
+        "fallback_reason": fallback_reason,
         "system_prompt_hash": _hash_prompt(system_prompt),
         "user_message_len": len(user_message),
         "created_at": _utc_now(),

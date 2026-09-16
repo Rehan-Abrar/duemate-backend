@@ -14,14 +14,19 @@ from typing import Optional
 
 from utils.academic import (
     get_user_academic_context,
+    get_published_section_context,
     match_course,
     course_matches,
     message_for_status,
+    normalize_requested_section,
     STATUS_OK,
 )
+from utils.timetable_universal import _parse_hhmm_minutes
 
 _DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
 _PKT = timezone(timedelta(hours=5))
+_RANGE_SPLIT = re.compile(r"\s*[-–—−‑]\s*")
+_MISSING_INSTRUCTOR = "Instructor information isn't available for this class."
 
 
 def _now_pkt() -> datetime:
@@ -31,14 +36,8 @@ def _now_pkt() -> datetime:
 # ── Time-window helpers (used by structured / NLU entry) ──────────────────────
 
 def _parse_hhmm(s: Optional[str]) -> Optional[int]:
-    """Parse "HH:MM" → minutes since midnight, or None."""
-    if not s:
-        return None
-    try:
-        h, m = map(int, s.split(":"))
-        return h * 60 + m
-    except Exception:
-        return None
+    """Parse HH:MM or H:MM AM/PM → minutes since midnight."""
+    return _parse_hhmm_minutes(s or "")
 
 
 def _min_to_12h(minutes: int) -> str:
@@ -60,13 +59,36 @@ def _within_window(
     Unknown slot time → pass (don't filter out).
     """
     start, end = _parse_slot_time(time_str)
-    if start is None:
+    return _bounds_within_window(start, end, after_min, before_min)
+
+
+def _bounds_within_window(
+    start: Optional[int],
+    end: Optional[int],
+    after_min: Optional[int] = None,
+    before_min: Optional[int] = None,
+) -> bool:
+    if start is None or end is None:
         return True
     if after_min is not None and end <= after_min:
-        return False  # slot finishes before our window starts
+        return False
     if before_min is not None and start >= before_min:
-        return False  # slot starts after our window ends
+        return False
     return True
+
+
+def _slot_within_window(
+    slot: dict,
+    after_min: Optional[int] = None,
+    before_min: Optional[int] = None,
+) -> bool:
+    start, end = _slot_bounds(slot)
+    return _bounds_within_window(start, end, after_min, before_min)
+
+
+def _slot_sort_key(slot: dict) -> int:
+    start, _ = _slot_bounds(slot)
+    return start if start is not None else 0
 
 
 def _resolve_day(day_str: Optional[str]) -> Optional[str]:
@@ -83,41 +105,75 @@ def _resolve_day(day_str: Optional[str]) -> Optional[str]:
 
 
 def _parse_slot_time(time_str: str) -> tuple[Optional[int], Optional[int]]:
-    """Return (start_min, end_min) since midnight."""
-    try:
-        start, end = time_str.split("-")
-        def _to_min(t):
-            h, m = map(int, t.strip().split(":"))
-            return h * 60 + m
-        return _to_min(start), _to_min(end)
-    except Exception:
+    """Return (start_min, end_min) for AM/PM, 24-hour, and unicode-dash ranges."""
+    if not time_str:
         return None, None
+    parts = _RANGE_SPLIT.split(str(time_str).strip(), maxsplit=1)
+    if len(parts) != 2:
+        return None, None
+    start = _parse_hhmm_minutes(parts[0].strip())
+    end = _parse_hhmm_minutes(parts[1].strip())
+    if start is None or end is None:
+        return None, None
+    return start, end
+
+
+def _slot_bounds(slot: dict) -> tuple[Optional[int], Optional[int]]:
+    """Prefer slot['time']; fall back to start_time/end_time from the parser."""
+    start, end = _parse_slot_time(slot.get("time") or "")
+    if start is not None:
+        return start, end
+    start = _parse_hhmm_minutes(str(slot.get("start_time") or "").strip())
+    end = _parse_hhmm_minutes(str(slot.get("end_time") or "").strip())
+    if start is None or end is None:
+        return None, None
+    return start, end
 
 
 def _format_time_12h(time_str: str) -> str:
-    try:
-        start, end = time_str.split("-")
-        def t12(t):
-            h, m = map(int, t.strip().split(":"))
-            ampm = "AM" if h < 12 else "PM"
-            h12 = h % 12 or 12
-            return f"{h12}:{m:02d} {ampm}"
-        return f"{t12(start)} - {t12(end)}"
-    except Exception:
+    start, end = _parse_slot_time(time_str)
+    if start is None or end is None:
         return time_str
+    return f"{_min_to_12h(start)} - {_min_to_12h(end)}"
+
+
+def _instructor_line(slot: dict) -> str:
+    instructors = slot.get("instructor", "")
+    if isinstance(instructors, list):
+        instructors = " & ".join(str(x).strip() for x in instructors if str(x).strip())
+    instructors = str(instructors or "").strip()
+    if not instructors or instructors in {".", "…", "...", "?", "-"}:
+        return _MISSING_INSTRUCTOR
+    return f"Instructor: {instructors}"
 
 
 def _format_slot(slot: dict, day: str) -> str:
-    instructors = slot.get("instructor", "")
-    if isinstance(instructors, list):
-        instructors = " & ".join(instructors)
+    time_label = _format_time_12h(slot.get("time") or "")
+    if time_label == (slot.get("time") or ""):
+        start, end = _slot_bounds(slot)
+        if start is not None and end is not None:
+            time_label = f"{_min_to_12h(start)} - {_min_to_12h(end)}"
     return (
-        f"{slot['course']}\n{day}, {_format_time_12h(slot['time'])}\n"
-        f"Room: {slot.get('room','?')}\nInstructor: {instructors}"
+        f"{slot.get('course', 'Class')}\n{day}, {time_label}\n"
+        f"Room: {slot.get('room') or '?'}\n{_instructor_line(slot)}"
     )
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
+
+def _next_class_anchor(from_day: Optional[str], current_day: str) -> tuple[int, bool]:
+    """
+    Where to start scanning, and whether the first day should skip already-passed
+    slots. Weekend / unknown weekdays roll to Monday without treating it as "now".
+    """
+    if from_day:
+        if from_day in _DAY_ORDER:
+            return _DAY_ORDER.index(from_day), from_day == current_day
+        return 0, False
+    if current_day in _DAY_ORDER:
+        return _DAY_ORDER.index(current_day), True
+    return 0, False
+
 
 def _get_next_class(
     timetable: dict,
@@ -125,21 +181,22 @@ def _get_next_class(
     *,
     time_after_min: Optional[int] = None,
     time_before_min: Optional[int] = None,
+    from_day: Optional[str] = None,
 ) -> str:
     """
     Return the next (or currently ongoing) class, optionally filtered by course
-    and/or a time window.  `time_after_min` / `time_before_min` are minutes since
-    midnight; pass None to skip that bound.  Default None reproduces the original
-    behaviour so existing callers are unaffected.
+    and/or a time window.  `from_day` is a resolved weekday (or today/tomorrow
+    already resolved by the caller).  When it differs from the current weekday,
+    search starts at 00:00 on that day.  Weekend dates roll to Monday.
     """
     now = _now_pkt()
     current_day = now.strftime("%A")
     current_minutes = now.hour * 60 + now.minute
 
     schedule = timetable.get("schedule", {})
-    day_index = _DAY_ORDER.index(current_day) if current_day in _DAY_ORDER else 0
+    day_index, apply_now_filter = _next_class_anchor(from_day, current_day)
 
-    for offset in range(7):
+    for offset in range(len(_DAY_ORDER)):
         day = _DAY_ORDER[(day_index + offset) % len(_DAY_ORDER)]
         day_slots = schedule.get(day, [])
 
@@ -147,21 +204,20 @@ def _get_next_class(
         for slot in day_slots:
             if target_course and not course_matches(slot.get("course", ""), target_course):
                 continue
-            if not _within_window(slot.get("time", ""), time_after_min, time_before_min):
+            if not _slot_within_window(slot, time_after_min, time_before_min):
                 continue
             valid_slots.append(slot)
 
-        # Sort by start time
-        valid_slots.sort(key=lambda s: _parse_slot_time(s.get("time", ""))[0] or 0)
+        valid_slots.sort(key=_slot_sort_key)
 
         for slot in valid_slots:
-            start_min, end_min = _parse_slot_time(slot.get("time", ""))
+            start_min, end_min = _slot_bounds(slot)
             if start_min is None or end_min is None:
                 continue
 
-            if offset == 0:
+            if apply_now_filter and offset == 0:
                 if end_min <= current_minutes:
-                    continue  # Passed
+                    continue
                 if start_min <= current_minutes < end_min:
                     prefix = "Current class:" if not target_course else f"Current {slot.get('course')} class:"
                     return f"*{prefix}*\n" + _format_slot(slot, day)
@@ -245,7 +301,7 @@ def _get_day_schedule(
     all_slots = timetable.get("schedule", {}).get(day, [])
 
     if time_after_min is not None or time_before_min is not None:
-        slots = [s for s in all_slots if _within_window(s.get("time", ""), time_after_min, time_before_min)]
+        slots = [s for s in all_slots if _slot_within_window(s, time_after_min, time_before_min)]
     else:
         slots = all_slots
 
@@ -255,7 +311,7 @@ def _get_day_schedule(
         return f"No classes scheduled for {day}."
 
     res = f"📅 *{day} Schedule:*\n\n"
-    for slot in sorted(slots, key=lambda s: _parse_slot_time(s.get("time", ""))[0] or 0):
+    for slot in sorted(slots, key=_slot_sort_key):
         res += _format_slot(slot, day) + "\n\n"
     return res.strip()
 
@@ -273,7 +329,7 @@ def _is_free(
     all_slots = timetable.get("schedule", {}).get(day, [])
     conflicts = [
         s for s in all_slots
-        if _within_window(s.get("time", ""), time_after_min, time_before_min)
+        if _slot_within_window(s, time_after_min, time_before_min)
     ]
 
     if not conflicts:
@@ -288,7 +344,7 @@ def _is_free(
         header = f"📅 You have {len(conflicts)} class(es) on *{day}*:\n\n"
 
     res = header
-    for slot in sorted(conflicts, key=lambda s: _parse_slot_time(s.get("time", ""))[0] or 0):
+    for slot in sorted(conflicts, key=_slot_sort_key):
         res += _format_slot(slot, day) + "\n\n"
     return res.strip()
 
@@ -299,8 +355,13 @@ def _get_full_timetable(timetable: dict) -> str:
         slots = timetable.get("schedule", {}).get(day, [])
         if slots:
             res += f"*{day}*\n"
-            for slot in sorted(slots, key=lambda s: _parse_slot_time(s.get("time", ""))[0] or 0):
-                res += f"• {_format_time_12h(slot['time'])}: {slot['course']} ({slot.get('room','?')})\n"
+            for slot in sorted(slots, key=_slot_sort_key):
+                time_label = _format_time_12h(slot.get("time") or "")
+                if time_label == (slot.get("time") or ""):
+                    start, end = _slot_bounds(slot)
+                    if start is not None and end is not None:
+                        time_label = f"{_min_to_12h(start)} - {_min_to_12h(end)}"
+                res += f"• {time_label}: {slot['course']} ({slot.get('room') or '?'})\n"
             res += "\n"
     return res.strip()
 
@@ -320,7 +381,8 @@ def _build_teachers_from_timetable(timetable: dict) -> dict:
             else:
                 instructors = [i.strip() for i in instr.split("/") if i.strip()]
             for name in instructors:
-                if not name:
+                name = str(name).strip()
+                if not name or name in {".", "…", "...", "?", "-"}:
                     continue
                 if name not in teachers:
                     teachers[name] = set()
@@ -345,10 +407,14 @@ def retrieve_schedule_context_structured(request: dict, db, user_id: Optional[st
     This is the NLU-path entry.  The legacy `retrieve_schedule_context(query, ...)` is
     retained unchanged so all existing callers (keyword path, tests) are unaffected.
     """
-    ctx = get_user_academic_context(db, user_id)
+    requested_section = normalize_requested_section(request.get("section"))
+    if requested_section:
+        ctx = get_published_section_context(db, requested_section)
+    else:
+        ctx = get_user_academic_context(db, user_id)
     if ctx["status"] != STATUS_OK:
         return {
-            "text": message_for_status(ctx["status"]),
+            "text": message_for_status(ctx["status"], section=ctx.get("section")),
             "data": None,
             "no_timetable": True,
         }
@@ -405,6 +471,7 @@ def retrieve_schedule_context_structured(request: dict, db, user_id: Optional[st
             timetable, target_course,
             time_after_min=time_after_min,
             time_before_min=time_before_min,
+            from_day=resolved_day,
         )
 
     return {"text": text, "data": None, "no_timetable": False}
@@ -413,11 +480,14 @@ def retrieve_schedule_context_structured(request: dict, db, user_id: Optional[st
 # ── Legacy entry (keyword-path and existing tests — unchanged) ────────────────
 
 def retrieve_schedule_context(query: str, db=None, user_id: str = None) -> str:
-    # Academic data comes only from the user's applicable timetable.
-    ctx = get_user_academic_context(db, user_id)
+    requested_section = normalize_requested_section(query)
+    if requested_section:
+        ctx = get_published_section_context(db, requested_section)
+    else:
+        ctx = get_user_academic_context(db, user_id)
     if ctx["status"] != STATUS_OK:
         # No silent static fallback — tell the user what to do.
-        return message_for_status(ctx["status"])
+        return message_for_status(ctx["status"], section=ctx.get("section"))
 
     timetable = {"schedule": ctx["schedule"]}
     courses = ctx["courses"]

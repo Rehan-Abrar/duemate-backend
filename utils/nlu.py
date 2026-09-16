@@ -24,13 +24,11 @@ import json
 import logging
 import os
 import re
-import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-import requests
-
-from utils.groq_config import GROQ_API_URL, get_groq_model
+from utils.groq_config import get_groq_model
+from utils.llm_client import complete_chat
 
 logger = logging.getLogger(__name__)
 
@@ -144,72 +142,19 @@ def _call_groq(
     db=None,
     prompt_version: str = "nlu_v1",
 ) -> str:
-    """
-    POST to Groq and return the raw model response string.
-    Times the call and logs via llm_logger. Raises on failure.
-    """
-    groq_api_key = os.getenv("GROQ_API_KEY", "")
-    if not groq_api_key:
-        raise RuntimeError("GROQ_API_KEY not configured")
-
-    payload: dict = {
-        "model": _groq_model(),
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 400,
-    }
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-
-    headers = {
-        "Authorization": f"Bearer {groq_api_key}",
-        "Content-Type": "application/json",
-    }
-
-    t0 = _time.perf_counter()
-    try:
-        resp = requests.post(
-            GROQ_API_URL, json=payload, headers=headers, timeout=_nlu_timeout()
-        )
-        resp.raise_for_status()
-        latency_ms = (_time.perf_counter() - t0) * 1000
-        data = resp.json()
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-
-        _log_call(
-            db=db, model=_groq_model(), prompt_version=prompt_version,
-            caller=caller, system_prompt=system_prompt, user_message=user_content,
-            response_data=data, latency_ms=latency_ms, success=True,
-        )
-        return content
-
-    except Exception as exc:
-        latency_ms = (_time.perf_counter() - t0) * 1000
-        _log_call(
-            db=db, model=_groq_model(), prompt_version=prompt_version,
-            caller=caller, system_prompt=system_prompt, user_message=user_content,
-            response_data=None, latency_ms=latency_ms, success=False, error=str(exc),
-        )
-        raise
-
-
-def _log_call(*, db, model, prompt_version, caller, system_prompt, user_message,
-              response_data, latency_ms, success, error=None):
-    """Wrapper around llm_logger.log_llm_call that never raises."""
-    try:
-        from utils.llm_logger import log_llm_call
-        log_llm_call(
-            db=db, model=model, prompt_version=prompt_version, caller=caller,
-            system_prompt=system_prompt, user_message=user_message,
-            response_data=response_data, latency_ms=latency_ms,
-            parse_method="nlu" if success else "nlu_fallback",
-            success=success, error=error,
-        )
-    except Exception as log_exc:
-        logger.debug("nlu: llm_logger skipped: %s", log_exc)
+    """LLM transport via the shared fallback client. Raises on total failure."""
+    result = complete_chat(
+        system_prompt,
+        user_content,
+        json_mode=json_mode,
+        timeout=_nlu_timeout(),
+        max_tokens=400,
+        db=db,
+        caller=caller,
+        prompt_version=prompt_version,
+        parse_method="nlu",
+    )
+    return result.content
 
 # ── JSON extraction (reuse the fence-tolerant version from parse_task) ────────
 
@@ -250,11 +195,23 @@ def _clamp_request(raw: dict) -> dict:
     }
 
     if intent == "schedule_query":
+        from utils.academic import normalize_requested_section
+
         sched = raw.get("schedule") or {}
+        course = sched.get("course") or None
+        section = normalize_requested_section(sched.get("section"))
+        if not section:
+            promoted = normalize_requested_section(course)
+            if promoted:
+                section = promoted
+                course = None
+        elif course and normalize_requested_section(course) == section:
+            course = None
         result["schedule"] = {
             "query_type": _clamp(sched.get("query_type"), _VALID_QUERY_TYPES, "next_class"),
-            "course": sched.get("course") or None,
+            "course": course,
             "teacher": sched.get("teacher") or None,
+            "section": section,
             "day": _clamp(
                 str(sched.get("day", "") or "").lower(), _VALID_DAYS, None
             ),
@@ -297,11 +254,21 @@ def understand(text: str, db=None) -> dict:
             raise ValueError("empty model response")
         raw = _extract_json(raw_text)
         result = _clamp_request(raw)
+        if result.get("intent") == "schedule_query":
+            from utils.academic import normalize_requested_section
+            sched = result["schedule"]
+            if not sched.get("section"):
+                from_text = normalize_requested_section(text)
+                if from_text:
+                    sched["section"] = from_text
+                    if sched.get("course") and normalize_requested_section(sched["course"]) == from_text:
+                        sched["course"] = None
         logger.info(
-            "nlu.understand intent=%s qt=%s day=%s lang=%s conf=%.2f text=%r",
+            "nlu.understand intent=%s qt=%s day=%s section=%s lang=%s conf=%.2f text=%r",
             result["intent"],
             result.get("schedule", {}).get("query_type", "-"),
             result.get("schedule", {}).get("day", "-"),
+            result.get("schedule", {}).get("section", "-"),
             result["language"],
             result["confidence"],
             text[:50],
@@ -370,6 +337,7 @@ def _execute_schedule(request: dict, db, user_id: str) -> dict:
         "query_type": sched.get("query_type", "next_class"),
         "course": sched.get("course"),
         "teacher": sched.get("teacher"),
+        "section": sched.get("section"),
         "day": sched.get("day"),
         "time_after_min": _parse_hhmm(sched.get("time_after")),
         "time_before_min": _parse_hhmm(sched.get("time_before")),
@@ -540,6 +508,12 @@ def _containment_guard(llm_output: str, deterministic_text: str) -> bool:
     if invented_times:
         logger.warning("nlu.respond: containment guard tripped — invented times %s", invented_times)
         return False
+
+    # LLM #2 must not invent placeholder instructor punctuation ("Instructor: … 😄")
+    for marker in ("…", "..."):
+        if marker in llm_output and marker not in deterministic_text:
+            logger.warning("nlu.respond: containment guard tripped — placeholder marker")
+            return False
 
     # If deterministic text is substantial but LLM output is tiny, suspect truncation
     if len(deterministic_text) > 80 and len(llm_output.strip()) < len(deterministic_text) * 0.25:

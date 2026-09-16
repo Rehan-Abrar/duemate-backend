@@ -23,10 +23,9 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-import requests
-
 from utils.rag import retrieve_schedule_context
-from utils.groq_config import GROQ_API_URL, get_groq_model
+from utils.groq_config import get_groq_model
+from utils.llm_client import complete_chat
 
 logger = logging.getLogger(__name__)
 
@@ -132,30 +131,17 @@ def _has_task_trigger(text: str) -> bool:
 # ── Groq API helpers ──────────────────────────────────────────────────────────
 
 def _call_groq(system_prompt: str, user_prompt: str, json_format: bool = False) -> str:
-    groq_api_key = os.getenv("GROQ_API_KEY", "")
-    if not groq_api_key:
-        raise RuntimeError("GROQ_API_KEY not configured")
-
-    payload = {
-        "model": get_groq_model(),
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 400,
-    }
-    if json_format:
-        payload["response_format"] = {"type": "json_object"}
-
-    headers = {
-        "Authorization": f"Bearer {groq_api_key}",
-        "Content-Type": "application/json",
-    }
-    response = requests.post(GROQ_API_URL, json=payload, headers=headers, timeout=15)
-    response.raise_for_status()
-    data = response.json()
-    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    result = complete_chat(
+        system_prompt,
+        user_prompt,
+        json_mode=json_format,
+        timeout=15,
+        max_tokens=400,
+        caller="classify_intent",
+        prompt_version="agent_intent_v1",
+        parse_method="agent",
+    )
+    return result.content
 
 
 # ── Public: classify_intent ───────────────────────────────────────────────────

@@ -20,7 +20,8 @@ from typing import Optional
 import dateparser
 from dateparser.search import search_dates
 
-from utils.groq_config import GROQ_API_URL, get_groq_model
+from utils.groq_config import get_groq_model
+from utils.llm_client import complete_chat
 
 try:
     import requests
@@ -920,123 +921,60 @@ def _parse_with_groq(
     if not HAS_REQUESTS:
         raise RuntimeError("requests library not available")
 
-    groq_api_key = os.getenv("GROQ_API_KEY", "")
-    if not groq_api_key:
-        raise RuntimeError("GROQ_API_KEY not configured")
-
     pkt = timezone(timedelta(hours=5))
     now_pkt = now.astimezone(pkt)
     today = now_pkt.strftime("%Y-%m-%d")
     system_prompt = _build_groq_system_prompt(today)
 
-    payload = {
-        "model": get_groq_model(),
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Parse this message:\n\n{message_text}"},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 500,
-        "response_format": {"type": "json_object"},
+    result = complete_chat(
+        system_prompt,
+        f"Parse this message:\n\n{message_text}",
+        json_mode=True,
+        timeout=15,
+        max_tokens=500,
+        db=db,
+        caller="_parse_with_groq",
+        prompt_version="parse_task_v2",
+        parse_method="groq",
+    )
+    data = result.raw
+    parsed = _extract_json_from_response(result.content)
+
+    task_type = str(parsed.get("task_type", "assignment")).lower()
+    if task_type not in ("assignment", "quiz"):
+        task_type = "assignment"
+
+    course = parsed.get("course")
+    if course and not isinstance(course, str):
+        course = None
+    elif course and course.lower() == "null":
+        course = None
+
+    title = parsed.get("title")
+    if title and not isinstance(title, str):
+        title = None
+    elif title and title.lower() == "null":
+        title = None
+
+    due_date = _normalize_due_date(parsed.get("due_date"), normalized_text, now)
+
+    confidence = parsed.get("confidence", 0.5)
+    if not isinstance(confidence, (int, float)):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, float(confidence)))
+
+    return {
+        "task_type": task_type,
+        "course": course,
+        "title": title,
+        "due_date": due_date,
+        "quiz_material": parsed.get("quiz_material") if task_type == "quiz" else None,
+        "quiz_duration": parsed.get("quiz_duration") if task_type == "quiz" else None,
+        "quiz_time": parsed.get("quiz_time") if task_type == "quiz" else None,
+        "confidence": round(confidence, 2),
+        "notes": parsed.get("notes"),
+        "groq_raw_response": data,
     }
-
-    headers = {
-        "Authorization": f"Bearer {groq_api_key}",
-        "Content-Type": "application/json",
-    }
-
-    import time as _time
-    _t0 = _time.perf_counter()
-    try:
-        response = requests.post(GROQ_API_URL, json=payload, headers=headers, timeout=15)
-        response.raise_for_status()
-        latency_ms = (_time.perf_counter() - _t0) * 1000
-
-        data = response.json()
-        raw_content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-
-        if not raw_content:
-            raise ValueError("Empty response from Groq API")
-
-        parsed = _extract_json_from_response(raw_content)
-
-        task_type = str(parsed.get("task_type", "assignment")).lower()
-        if task_type not in ("assignment", "quiz"):
-            task_type = "assignment"
-
-        course = parsed.get("course")
-        if course and not isinstance(course, str):
-            course = None
-        elif course and course.lower() == "null":
-            course = None
-
-        title = parsed.get("title")
-        if title and not isinstance(title, str):
-            title = None
-        elif title and title.lower() == "null":
-            title = None
-
-        due_date = _normalize_due_date(parsed.get("due_date"), normalized_text, now)
-
-        confidence = parsed.get("confidence", 0.5)
-        if not isinstance(confidence, (int, float)):
-            confidence = 0.5
-        confidence = max(0.0, min(1.0, float(confidence)))
-
-        # ── LLMOps: log successful call ───────────────────────────────────
-        try:
-            from utils.llm_logger import log_llm_call
-            log_llm_call(
-                db=db,
-                model=get_groq_model(),
-                prompt_version="parse_task_v2",
-                caller="_parse_with_groq",
-                system_prompt=system_prompt,
-                user_message=message_text,
-                response_data=data,
-                latency_ms=latency_ms,
-                confidence=confidence,
-                parse_method="groq",
-                success=True,
-            )
-        except Exception as log_exc:
-            logger.debug("llm_logger skipped: %s", log_exc)
-
-        return {
-            "task_type": task_type,
-            "course": course,
-            "title": title,
-            "due_date": due_date,
-            "quiz_material": parsed.get("quiz_material") if task_type == "quiz" else None,
-            "quiz_duration": parsed.get("quiz_duration") if task_type == "quiz" else None,
-            "quiz_time": parsed.get("quiz_time") if task_type == "quiz" else None,
-            "confidence": round(confidence, 2),
-            "notes": parsed.get("notes"),
-            "groq_raw_response": data,
-        }
-
-    except Exception as exc:
-        latency_ms = (_time.perf_counter() - _t0) * 1000
-        # ── LLMOps: log failed call ───────────────────────────────────────
-        try:
-            from utils.llm_logger import log_llm_call
-            log_llm_call(
-                db=db,
-                model=get_groq_model(),
-                prompt_version="parse_task_v2",
-                caller="_parse_with_groq",
-                system_prompt=system_prompt,
-                user_message=message_text,
-                response_data=None,
-                latency_ms=latency_ms,
-                confidence=None,
-                parse_method="regex_fallback",
-                success=False,
-                error=str(exc),
-            )
-        except Exception as log_exc:
-            logger.debug("llm_logger skipped on error path: %s", log_exc)
-        raise
 
 
 def _parse_with_regex_fallback(

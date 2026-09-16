@@ -16,6 +16,7 @@ prompt_text: >
       "query_type": "next_class" | "day_schedule" | "course_schedule" | "teacher" | "full_timetable" | "free_check",
       "course": "<exact text student wrote, e.g. 'CN', 'parallel computing'> or null",
       "teacher": "<exact teacher text student wrote> or null",
+      "section": "<explicit class section the student named, e.g. 'BSCS-7A', 'BSCS 7B'> or null",
       "day": "today" | "tomorrow" | "monday" | "tuesday" | "wednesday" | "thursday" | "friday" | null,
       "time_after": "HH:MM" | null,
       "time_before": "HH:MM" | null
@@ -53,6 +54,12 @@ prompt_text: >
   - teacher: who teaches a course / teacher's schedule
   - full_timetable: full weekly schedule
   - free_check: yes/no — am I free / do I have class at this time?
+
+  SECTION FIELD:
+  - If the student explicitly names a class section (BSCS-7A, "BSCS 7B", BSSE-7C, BSDS-4A, …), copy that text into schedule.section. This is a PUBLIC timetable lookup, not "my" timetable.
+  - "my timetable" / "my next class" / "mera timetable" with NO section name → section null.
+  - Do not invent a section. If none was named, section is null.
+  - A named section plus "timetable" / "classes" → full_timetable (or day_schedule when a day is also named).
 
   TIME EXTRACTION (always 24-hour "HH:MM"):
   - "2 baje" / "2pm" / "2 o'clock" / "after 2" → time_after "14:00"
@@ -110,7 +117,19 @@ prompt_text: >
   {"intent":"schedule_query","language":"mixed","schedule":{"query_type":"teacher","course":"networks","teacher":null,"day":null,"time_after":null,"time_before":null},"confidence":0.94}
 
   Message: "show my timetable"
-  {"intent":"schedule_query","language":"en","schedule":{"query_type":"full_timetable","course":null,"teacher":null,"day":null,"time_after":null,"time_before":null},"confidence":0.99}
+  {"intent":"schedule_query","language":"en","schedule":{"query_type":"full_timetable","course":null,"teacher":null,"section":null,"day":null,"time_after":null,"time_before":null},"confidence":0.99}
+
+  Message: "show me BSCS 7B timetable"
+  {"intent":"schedule_query","language":"en","schedule":{"query_type":"full_timetable","course":null,"teacher":null,"section":"BSCS 7B","day":null,"time_after":null,"time_before":null},"confidence":0.98}
+
+  Message: "BSCS 7A ka timetable"
+  {"intent":"schedule_query","language":"mixed","schedule":{"query_type":"full_timetable","course":null,"teacher":null,"section":"BSCS 7A","day":null,"time_after":null,"time_before":null},"confidence":0.97}
+
+  Message: "what classes does BSCS 7B have tomorrow?"
+  {"intent":"schedule_query","language":"en","schedule":{"query_type":"day_schedule","course":null,"teacher":null,"section":"BSCS 7B","day":"tomorrow","time_after":null,"time_before":null},"confidence":0.96}
+
+  Message: "BSCS 7C Monday classes"
+  {"intent":"schedule_query","language":"en","schedule":{"query_type":"day_schedule","course":null,"teacher":null,"section":"BSCS 7C","day":"monday","time_after":null,"time_before":null},"confidence":0.96}
 
   Message: "monday ki classes kya hain?"
   {"intent":"schedule_query","language":"mixed","schedule":{"query_type":"day_schedule","course":null,"teacher":null,"day":"monday","time_after":null,"time_before":null},"confidence":0.96}

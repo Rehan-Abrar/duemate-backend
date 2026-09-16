@@ -113,6 +113,8 @@ class TestHandleMessageDegradedPath:
         """Degraded → classify_intent → query_schedule → agent reply."""
         import requests as req
         monkeypatch.setenv("GROQ_API_KEY", "")  # Force Groq to fail → _degraded
+        monkeypatch.delenv("GROQ_API_KEY_v2", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
 
         fake_db = MagicMock()
         # Patch rag to avoid real DB lookups
