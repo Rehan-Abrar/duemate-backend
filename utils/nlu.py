@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import textwrap
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -56,6 +57,24 @@ _VALID_LANGUAGES = frozenset({"en", "ur", "mixed"})
 _VALID_OOS_KINDS = frozenset({"casual", "internal", "unrelated"})
 _TIME_RE = re.compile(r"^\d{2}:\d{2}$")
 _OOS_TOPIC_RE = re.compile(r"^[a-z]+(?:[ -][a-z]+){0,2}$")
+# Genuine new-request cues — not course names. Used only to avoid treating
+# a real query as a pending-create field fill.
+_PENDING_INTERRUPT_RE = re.compile(
+    r"(?:[?؟]|"
+    r"\b(?:when|what|what's|whats|which|who|where|how)\b|"
+    r"\b(?:show|tell|list)\b|"
+    r"\b(?:schedule|timetable)\b|"
+    r"\b(?:classes|lectures|class|lecture)\b|"
+    r"\b(?:free|teacher|teaches)\b|"
+    r"\b(?:kab|kya|mera|mere)\b|"
+    r"\b(?:tasks?|assignments?)\b|"
+    r"\b(?:cancel|nevermind|never mind)\b"
+    r")",
+    re.IGNORECASE,
+)
+_PENDING_INTENT_INTERRUPTS = frozenset({
+    "greeting", "help", "out_of_scope", "task_action",
+})
 _OOS_TOPIC_BLOCKED = frozenset({
     "prompt", "prompts", "instruction", "instructions", "system", "backend",
     "secret", "secrets", "password", "token", "key", "api", "internal",
@@ -139,17 +158,17 @@ def _is_trivial_greeting(text: str) -> bool:
     words = t.split()
     return 1 <= len(words) <= 2 and all(w in _TRIVIAL_TOKENS for w in words)
 
-# ── Prompt loading (same YAML convention as prompts/parse_task_v2.yaml) ───────
+# ── Prompt loading (YAML block scalar; indentation is not sent to the model) ──
 
 def _load_prompt(filename: str) -> str:
-    """Load prompt from prompts/<filename>. Falls back to empty string on error."""
+    """Load prompt_text from prompts/<filename> as a YAML |/> block scalar."""
     try:
         path = os.path.join(os.path.dirname(__file__), "..", "prompts", filename)
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
-        match = re.search(r"prompt_text:\s*>(.*)", content, re.DOTALL)
+        match = re.search(r"^prompt_text:\s*[>|][+-]?\s*\n(.*)", content, re.DOTALL | re.MULTILINE)
         if match:
-            return match.group(1).strip()
+            return textwrap.dedent(match.group(1)).strip()
     except Exception as exc:
         logger.warning("nlu: failed to load prompt %s: %s", filename, exc)
     return ""
@@ -385,13 +404,18 @@ def _understand_user_content(text: str, session: Optional[dict]) -> str:
     session = session or {}
     pending = session.get("pending_create")
     if pending:
-        draft = pending.get("draft") or pending
-        parts.append("Pending_create: " + json.dumps({
+        from utils.task_actions import deserialize_draft, missing_create_fields
+        draft = deserialize_draft(pending.get("draft") or pending)
+        payload = {
             "task_type": draft.get("task_type"),
             "course": draft.get("course"),
             "has_due_date": bool(draft.get("due_date")),
             "has_explicit_time": bool(draft.get("has_explicit_time")),
-        }, ensure_ascii=True))
+        }
+        missing = missing_create_fields(draft)
+        if missing:
+            payload["awaiting"] = missing[0]
+        parts.append("Pending_create: " + json.dumps(payload, ensure_ascii=True))
     pending_action = session.get("pending_action")
     if pending_action:
         parts.append("Pending_action: " + json.dumps({
@@ -402,6 +426,95 @@ def _understand_user_content(text: str, session: Optional[dict]) -> str:
     if last_labels:
         parts.append("Recently_listed_tasks: " + json.dumps(last_labels[:8], ensure_ascii=True))
     return "\n".join(parts)
+
+
+def _pending_awaiting_field(session: Optional[dict]) -> Optional[str]:
+    pending = (session or {}).get("pending_create")
+    if not pending:
+        return None
+    from utils.task_actions import deserialize_draft, missing_create_fields
+    draft = deserialize_draft(pending.get("draft") or pending)
+    missing = missing_create_fields(draft)
+    return missing[0] if missing else None
+
+
+def _looks_like_clock_time(text: str) -> bool:
+    from utils.parse_task import QUIZ_TIME_PATTERN, TIME_RANGE_PATTERN, BEFORE_TIME_PATTERN
+    t = text or ""
+    return bool(
+        QUIZ_TIME_PATTERN.search(t)
+        or TIME_RANGE_PATTERN.search(t)
+        or BEFORE_TIME_PATTERN.search(t)
+    )
+
+
+def _message_is_pending_interrupt(text: str, request: dict) -> bool:
+    """True when THIS message is a genuine new request, not a field fill."""
+    if (request or {}).get("intent") in _PENDING_INTENT_INTERRUPTS:
+        return True
+    return bool(_PENDING_INTERRUPT_RE.search(text or ""))
+
+
+def _as_save_task(request: dict) -> dict:
+    out = dict(request or {})
+    out["intent"] = "save_task"
+    out.pop("schedule", None)
+    out.pop("task", None)
+    if not isinstance(out.get("save_task"), dict):
+        out["save_task"] = {"needs_clarification": True}
+    return out
+
+
+def _reconcile_pending_create(
+    request: dict,
+    text: str,
+    session: Optional[dict],
+    db=None,
+    user_id: Optional[str] = None,
+) -> dict:
+    """
+    After LLM #1, keep a short field-fill on the pending create.
+
+    Does not override genuine interrupts (queries, greetings, cancel, …).
+    Course resolution uses academic.match_course — no course-name keyword lists.
+    """
+    awaiting = _pending_awaiting_field(session)
+    if not awaiting or not request or request.get("intent") == "_degraded":
+        return request
+    if _message_is_pending_interrupt(text, request):
+        return request
+
+    if awaiting == "course":
+        try:
+            from utils.academic import get_user_academic_context, match_course
+            ctx = get_user_academic_context(db, user_id) if db is not None else {}
+            matched = match_course(text, ctx.get("courses") or [], ctx.get("aliases") or {})
+        except Exception as exc:
+            logger.warning("nlu: pending course match failed (%s)", exc)
+            matched = None
+        if matched:
+            logger.info("nlu: pending course fill matched=%r text=%r", matched, (text or "")[:40])
+            return _as_save_task(request)
+        return request
+
+    if awaiting == "due_date":
+        try:
+            from utils.parse_task import detect_due_date, _utc_now as parse_now
+            due = detect_due_date(text, parse_now())
+        except Exception as exc:
+            logger.warning("nlu: pending date parse failed (%s)", exc)
+            due = None
+        if due is not None:
+            logger.info("nlu: pending date fill text=%r", (text or "")[:40])
+            return _as_save_task(request)
+        return request
+
+    if awaiting == "due_time" and _looks_like_clock_time(text):
+        logger.info("nlu: pending time fill text=%r", (text or "")[:40])
+        return _as_save_task(request)
+
+    return request
+
 
 # ── Backend execution (pure Python — the only source of facts) ────────────────
 
@@ -772,7 +885,7 @@ def handle_message(db, user_id: str, phone: str, text: str) -> dict:
     Main NLU entry point for WhatsApp and the web assistant.
 
     Every message is understood by LLM #1 first. Pending create/action state is
-    passed as context only — it never short-circuits routing.
+    passed as context; Python then reconciles short field-fills before execute.
 
     Returns:
       {"action": "reply", "text": str, "intent": str}
@@ -798,6 +911,7 @@ def handle_message(db, user_id: str, phone: str, text: str) -> dict:
             logger.info("nlu: degraded, using fallback classifier text=%r", text[:40])
             return _fallback_handle(db, user_id, phone, text)
 
+        request = _reconcile_pending_create(request, text, session, db, user_id)
         intent = request["intent"]
         logger.info(
             "nlu: intent=%s lang=%s conf=%.2f text=%r",
@@ -854,6 +968,12 @@ def _handle_save_task(db, user_id, phone, text, request, session) -> dict:
     )
     draft = apply_parse_to_draft(draft, parsed)
     missing = missing_create_fields(draft)
+    if missing and missing[0] == "due_time" and draft.get("due_date"):
+        from utils.parse_task import QUIZ_TIME_PATTERN, _apply_explicit_time, _utc_now as parse_now
+        if QUIZ_TIME_PATTERN.search(text or ""):
+            draft["due_date"] = _apply_explicit_time(text, draft["due_date"], parse_now())
+            draft["has_explicit_time"] = True
+            missing = missing_create_fields(draft)
     if missing:
         save_nlu_session(
             db, user_id, phone,

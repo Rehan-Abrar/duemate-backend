@@ -47,8 +47,25 @@ def apply_parse_to_draft(draft: dict, parsed: dict) -> dict:
     if parsed.get("title"):
         out["title"] = parsed["title"]
     if parsed.get("due_date"):
-        out["due_date"] = parsed["due_date"]
-        out["has_explicit_time"] = bool(parsed.get("has_explicit_time"))
+        existing = out.get("due_date")
+        new = parsed["due_date"]
+        # A time-only reply should keep the day already collected on the draft.
+        if (
+            existing
+            and not out.get("has_explicit_time")
+            and parsed.get("has_explicit_time")
+            and hasattr(existing, "astimezone")
+            and hasattr(new, "astimezone")
+        ):
+            e = existing.astimezone(_PKT)
+            n = new.astimezone(_PKT)
+            out["due_date"] = e.replace(
+                hour=n.hour, minute=n.minute, second=0, microsecond=0,
+            ).astimezone(timezone.utc)
+            out["has_explicit_time"] = True
+        else:
+            out["due_date"] = new
+            out["has_explicit_time"] = bool(parsed.get("has_explicit_time"))
     elif "has_explicit_time" in parsed and out.get("due_date"):
         if parsed.get("has_explicit_time"):
             out["has_explicit_time"] = True

@@ -4,6 +4,7 @@ All tests are offline: Groq is mocked so no network calls are made.
 """
 import json
 import os
+import re
 import sys
 import pytest
 
@@ -15,6 +16,7 @@ from utils.nlu import (
     _clamp_request,
     _is_trivial_greeting,
     _extract_json,
+    _load_prompt,
     understand,
     GREETING_REPLY,
 )
@@ -486,3 +488,39 @@ class TestUnderstand:
         assert result["intent"] == "out_of_scope"
         assert result["out_of_scope"]["kind"] == "unrelated"
         assert result["out_of_scope"]["topic"] == "weather"
+
+
+# ── understand prompt (token budget / coverage) ───────────────────────────────
+
+class TestUnderstandPrompt:
+    def test_yaml_indent_not_sent_and_coverage_kept(self):
+        prompt = _load_prompt("nlu_understand_v1.yaml")
+        assert prompt
+        assert not prompt.startswith(" ")
+        assert prompt.startswith("You are a message-understanding API")
+
+        messages = re.findall(r"^Message: ", prompt, re.M)
+        assert 18 <= len(messages) <= 28
+        tokens = round(len(prompt) / 4)
+        assert 1500 <= tokens <= 2500
+
+        for needle in (
+            "when is my next class?",
+            "mera agla lecture",
+            "kal 2 bajay",
+            "CN kab hai?",
+            "bhai kal free",
+            "Do I have PDC tomorrow?",
+            "show my timetable",
+            "BSCS 7B",
+            '"quiz"',
+            "Pending_create:",
+            "show tasks",
+            '"Information Security"',
+            "awaiting",
+            "good shit",
+            "backend instructions",
+            "weather in Lahore",
+        ):
+            assert needle in prompt, needle
+        assert prompt.count("Pending_create:") >= 4
