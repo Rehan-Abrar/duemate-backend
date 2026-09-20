@@ -290,3 +290,30 @@ class TestAdminInboxMessages:
         assert body["total_messages"] == 5
         assert body["messages_today"] >= 1
         assert body["recent_contacts"] >= 1
+
+    def test_message_bot_response_serialization_and_search(self, ctx):
+        client, db = ctx
+        _seed(db)
+        from app import _utc_now
+        db.messages.insert_one({
+            "message_id": "msg_bot_test_123",
+            "from": "923217857439",
+            "from_name": "Alina Asif Khan",
+            "text": "bscs 7b timetable",
+            "bot_response": "Here is the timetable for BSCS 7B: PDC at 8:00 AM.",
+            "intent": "timetable_query",
+            "action": "reply",
+            "received_at": _utc_now(),
+        })
+        response = client.get(
+            "/api/admin/inbox/contacts/923217857439/messages?q=PDC",
+            headers=_admin(),
+        )
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body["count"] == 1
+        item = body["items"][0]
+        assert item["bot_response"] == "Here is the timetable for BSCS 7B: PDC at 8:00 AM."
+        assert item["intent"] == "timetable_query"
+        assert item["action"] == "reply"
+

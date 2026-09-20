@@ -219,6 +219,13 @@ def _serialize_inbox_message(doc: dict) -> dict:
         "timestamp": _serialize_for_json(doc.get("timestamp")),
         "received_at": _serialize_for_json(doc.get("received_at")),
         "delivery_status": doc.get("delivery_status"),
+        "bot_response": doc.get("bot_response") or doc.get("response") or doc.get("response_text"),
+        "intent": doc.get("intent"),
+        "action": doc.get("action"),
+        "is_forwarded": doc.get("is_forwarded", False),
+        "forwarded_from": doc.get("forwarded_from"),
+        "source_key": doc.get("source_key"),
+        "request_id": doc.get("request_id"),
     }
 
 
@@ -1326,6 +1333,19 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
 
                 if _nlu_result["action"] == "reply":
                     summary["inbound_messages"] += 1
+                    bot_reply_text = _nlu_result.get("text", "")
+                    if message_id:
+                        db.messages.update_one(
+                            {"message_id": message_id},
+                            {
+                                "$set": {
+                                    "bot_response": bot_reply_text,
+                                    "intent": _nlu_result.get("intent"),
+                                    "action": _nlu_result.get("action"),
+                                    "response_at": _utc_now(),
+                                }
+                            },
+                        )
                     app.logger.info(
                         "nlu_handled from=%s intent=%s text=%r",
                         sender, _nlu_result.get("intent"), text_body[:50],
@@ -1333,7 +1353,7 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                     try:
                         send_text_message(
                             to_number=normalized_sender or sender,
-                            message_body=_nlu_result["text"],
+                            message_body=bot_reply_text,
                             preview_url=False,
                         )
                     except Exception as _send_err:
@@ -1376,6 +1396,27 @@ def process_webhook_payload(data: dict, request_id: str) -> dict:
                 dashboard_url = _normalize_dashboard_url(
                     get_env("DASHBOARD_URL", default="https://duemate-dashboard.vercel.app")
                 )
+
+                ack_text = format_task_acknowledgment(
+                    task_type=parse_result["task_type"],
+                    course=parse_result.get("course"),
+                    due_date=parse_result.get("due_date"),
+                    is_duplicate=is_potential_duplicate,
+                    needs_review=parse_result.get("needs_review", False),
+                    dashboard_url=dashboard_url,
+                )
+                if message_id:
+                    db.messages.update_one(
+                        {"message_id": message_id},
+                        {
+                            "$set": {
+                                "bot_response": ack_text,
+                                "intent": _nlu_result.get("intent", "save_task"),
+                                "action": _nlu_result.get("action", "save_task"),
+                                "response_at": _utc_now(),
+                            }
+                        },
+                    )
 
                 # NLU owns clarification. Never start the legacy course menu.
                 send_result = send_task_acknowledgment(
@@ -2069,7 +2110,11 @@ def create_app() -> Flask:
         query: dict = {"from": wa_id}
         text_q = (request.args.get("q") or "").strip()
         if text_q:
-            query["text"] = {"$regex": re.escape(text_q), "$options": "i"}
+            pattern = re.escape(text_q)
+            query["$or"] = [
+                {"text": {"$regex": pattern, "$options": "i"}},
+                {"bot_response": {"$regex": pattern, "$options": "i"}},
+            ]
         since = _parse_query_datetime(request.args.get("since", ""))
         until = _parse_query_datetime(request.args.get("until", ""), end_of_day=True)
         if since or until:
