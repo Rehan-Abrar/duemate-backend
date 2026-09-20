@@ -319,16 +319,15 @@ def get_user_academic_context(db, user_id: str) -> dict:
 NO_TIMETABLE_MESSAGES = {
     STATUS_NO_DB: "I'm having trouble reaching the database right now. Please try again shortly.",
     STATUS_NO_TIMETABLE: (
-        "I don't have your timetable yet. Upload it (or pick your section) from the "
+        "I don't know your section yet. Please pick your section from the "
         "dashboard and I'll be able to answer schedule questions."
     ),
     STATUS_NO_SECTION: (
-        "You've uploaded a timetable but haven't selected your section yet. "
-        "Please pick your section in the dashboard first."
+        "Please select your section in the dashboard first to get schedule answers."
     ),
     STATUS_EMPTY: (
-        "Your selected section doesn't have any classes yet. Try re-uploading your "
-        "timetable or selecting a different section."
+        "Your selected section doesn't have any classes right now. Please check or "
+        "select a different section in the dashboard."
     ),
 }
 
@@ -339,5 +338,6 @@ def message_for_status(status: str, section: Optional[str] = None) -> str:
             return f"I couldn't find a published timetable for {section}."
         return "I couldn't find a published timetable for that section."
     return NO_TIMETABLE_MESSAGES.get(
-        status, "I don't have your timetable yet. Please set it up from the dashboard."
+        status, "I don't know your section yet. Please pick your section from the dashboard."
     )
+

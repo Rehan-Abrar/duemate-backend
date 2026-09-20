@@ -50,7 +50,7 @@ class TestNoTimetableLeak:
         db = mongomock.MongoClient().db
         reply = rag.retrieve_schedule_context("when is my next class", db=db, user_id="wa:1")
         _assert_no_leak(reply)
-        assert "timetable" in reply.lower()
+        assert "section" in reply.lower()
 
     def test_no_section_message(self):
         db = mongomock.MongoClient().db

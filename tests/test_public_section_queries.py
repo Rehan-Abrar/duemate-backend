@@ -138,7 +138,7 @@ class TestPublicSectionQueries:
         assert result["no_timetable"] is True
         assert COURSE_A not in result["text"]
         assert COURSE_B not in result["text"]
-        assert "timetable" in result["text"].lower()
+        assert "section" in result["text"].lower()
 
         via_execute = execute(
             {
