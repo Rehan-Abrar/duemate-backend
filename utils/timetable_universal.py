@@ -9,7 +9,9 @@ Ported from Test/timetable_universal.py with the following additions:
 
 Supported format: Riphah University grid-format timetables (new campus).
   - Each page = one weekday (Mon–Fri).
-  - Left column: room labels (Classroom 1, Computer Lab 2, FYP Lab, Physics Lab).
+  - Left column: room labels. Either names (Classroom 1, Computer Lab 2, FYP Lab,
+    Physics Lab) or bare room numbers (210, 211, 117, ...) — the latest
+    RSCI timetable uses numbers, one per row.
   - Top row: time columns (HH:MM + AM/PM, y < 110). Last printed header is
     4:30 PM; a class that occupies that column ends at 5:00 PM.
   - Cells: section markers (BSCS-7B etc.) + course name.
@@ -186,6 +188,12 @@ _ROOM_CONTINUERS = frozenset({
 })
 # First glyph of a cell (e.g. "AI") often sits a few px left of the grid line.
 _CELL_LEFT_SLOP = 8.0
+# Room-row geometry. The latest RSCI timetable labels rows with bare numbers
+# sitting one row apart; older formats keep a label's number within half a row
+# of its head word. Clamped so a mis-detected row height cannot swamp the rule.
+_ROOM_ROW_H_DEFAULT = 18.6
+_ROOM_ROW_H_MIN = 12.0
+_ROOM_ROW_H_MAX = 24.0
 _TIME_TOKEN = re.compile(r'^\d{1,2}:\d{2}$')
 _TIME_LABEL = re.compile(r'^(\d{1,2}):(\d{2})(?:\s*(AM|PM))?$', re.IGNORECASE)
 
@@ -202,12 +210,22 @@ def _is_room_label_word(w, xmax: float = 110.0) -> bool:
     return True
 
 
-def _starts_new_room_row(current: List, token) -> bool:
+def _starts_new_room_row(current: List, token,
+                         row_h: float = _ROOM_ROW_H_DEFAULT) -> bool:
     """
     Decide whether `token` begins the next left-column room label.
 
-    Numbers and words like 'Lab' continue the current label (they may sit on
-    a wrapped second line). A new left-aligned title word starts a new row.
+    Words like 'Lab' continue the current label (they may sit on a wrapped
+    second line). A new left-aligned title word starts a new row.
+
+    A bare number is special: in the latest RSCI timetable the room labels ARE
+    numbers ('210', '211', ...) with one label per row, so a number that sits
+    about a row below the current label starts a new row. In the older formats
+    a number is the tail of a label ('Classroom 1', 'Lab 2') and sits within
+    half a row of its head word, so it continues the label.
+
+    `row_h` is the measured row height; it keeps a default so callers outside
+    _rooms() (scripts/tests) still work without measuring the page.
     """
     text = token[4].strip()
     y, x = token[1], token[0]
@@ -215,7 +233,7 @@ def _starts_new_room_row(current: List, token) -> bool:
     last_y = current[-1][1]
 
     if re.fullmatch(r'\d{1,3}', text):
-        return False
+        return (y - last_y) >= row_h * 0.5
     if text.lower() in _ROOM_CONTINUERS:
         return False
     if y - first_y > 16:
@@ -480,6 +498,11 @@ class UniversalTimetableParser:
         return 110.0
 
     def _row_height(self, page) -> float:
+        """Median single-row height, or 30.0 when it cannot be measured.
+
+        Callers that rely on the "one row" assumption clamp it themselves (see
+        _rooms), so the raw value returned here is not guaranteed to be one row.
+        """
         heights = []
         for d in page.get_drawings():
             r = d.get('rect')
@@ -648,10 +671,12 @@ class UniversalTimetableParser:
         if not tokens:
             return {}
 
+        # Clamp so a mis-detected row height cannot swamp the numeric-label rule.
+        row_h = min(max(self._row_height(page), _ROOM_ROW_H_MIN), _ROOM_ROW_H_MAX)
         rows: List[List] = []
         current = [tokens[0]]
         for t in tokens[1:]:
-            if _starts_new_room_row(current, t):
+            if _starts_new_room_row(current, t, row_h):
                 rows.append(current)
                 current = [t]
             else:
