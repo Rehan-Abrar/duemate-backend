@@ -320,8 +320,9 @@ def _is_suspicious_due_date(dt: datetime, text: str, now: datetime) -> bool:
             re.IGNORECASE,
         ):
             return True
+    has_explicit_year = bool(re.search(r"\b20\d{2}\b", text))
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    if _ensure_utc(dt) < today_start:
+    if not has_explicit_year and _ensure_utc(dt) < today_start:
         return True
     return False
 

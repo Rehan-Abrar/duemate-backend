@@ -130,9 +130,21 @@ OUT_OF_SCOPE_REPLY = (
     "• _\"what do I have due this week?\"_"
 )
 
+# Empathetic reply for emotional/casual messages ("im sad", "I'm tired", etc.)
+# This is a warm fallback — when LLM routing is on, LLM #2 will rephrase it
+# naturally based on context. When routing is off, this is shown as-is.
 OUT_OF_SCOPE_CASUAL = (
-    "Haha, glad it's working 😄. I can help with your timetable and academic tasks."
+    "I hear you. Hope things get better! 🙂 "
+    "I can help with your timetable and assignments if you need anything."
 )
+
+# Reply for conversational social questions ("how are you?", "what's up?", etc.)
+# Must NOT be the same as GREETING_REPLY — these are mid-conversation exchanges.
+OUT_OF_SCOPE_CONVERSATIONAL = (
+    "I'm doing well — thanks for asking! 😊 "
+    "What can I help you with today?"
+)
+
 OUT_OF_SCOPE_INTERNAL = (
     "I can help with your timetable and academic tasks, but I can't provide "
     "internal system instructions."
@@ -166,15 +178,31 @@ def _is_dashboard_required(text: str) -> bool:
 
 # ── Trivial-greeting fast path ────────────────────────────────────────────────
 # A TINY exact-match set used only for latency/cost, NOT as a meaning classifier.
+# IMPORTANT: conversational questions like "how are you?" or "what's up?" are
+# intentionally EXCLUDED — they must go through LLM #1 for natural handling.
 _TRIVIAL_TOKENS = frozenset({
     "hi", "hello", "hey", "salam", "assalam", "assalamualaikum", "helo", "hola",
-    "yo", "sup", "ok", "okay", "thanks", "thank you", "shukriya", "jazakallah",
-    "thx", "ty", "acha", "theek", "k", "start", "test", "ping", "nice", "good",
+    "yo", "ok", "okay", "thanks", "thank you", "shukriya", "jazakallah",
+    "thx", "ty", "acha", "theek", "k", "start", "test", "ping",
 })
 
+# Patterns that look like greetings but are actually conversational exchanges.
+# These must NOT hit the trivial fast-path — they need semantic handling.
+_CONVERSATIONAL_PATTERNS = re.compile(
+    r"^(?:how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up|are\s+you\s+there"
+    r"|how\s+are\s+you\s+doing|kya\s+haal|kaise\s+ho|kya\s+chal\s+raha)\b",
+    re.IGNORECASE,
+)
+
 def _is_trivial_greeting(text: str) -> bool:
-    """True only for single/two-token messages that are clearly greetings/acks."""
+    """True only for single/two-token messages that are clearly greetings/acks.
+    Conversational questions (how are you, what's up) return False so they reach
+    LLM #1 for proper semantic understanding.
+    """
     t = re.sub(r"\s+", " ", (text or "").strip().lower())
+    # Never fast-path conversational questions — they need LLM understanding
+    if _CONVERSATIONAL_PATTERNS.match(t):
+        return False
     # Check full phrase first (catches multi-word tokens like "thank you")
     if t in _TRIVIAL_TOKENS:
         return True
@@ -257,7 +285,16 @@ def _sanitize_oos_topic(raw) -> Optional[str]:
     return topic
 
 
-def _out_of_scope_reply(request: dict) -> str:
+# Conversational exchanges that _out_of_scope_reply distinguishes from
+# pure emotional venting (casual). These are social questions about the bot.
+_CONVERSATIONAL_SOCIAL_RE = re.compile(
+    r"^(?:how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up|are\s+you\s+there"
+    r"|how\s+are\s+you\s+doing|kya\s+haal|kaise\s+ho)\b",
+    re.IGNORECASE,
+)
+
+
+def _out_of_scope_reply(request: dict, text: str = "") -> str:
     """Deterministic reply from LLM #1's out_of_scope kind — no extra model call."""
     intent = request.get("intent")
     oos = request.get("out_of_scope") or {}
@@ -268,6 +305,9 @@ def _out_of_scope_reply(request: dict) -> str:
         return DASHBOARD_REQUIRED_REPLY
 
     if kind == "casual":
+        # Distinguish social questions (how are you) from emotional venting (im sad)
+        if text and _CONVERSATIONAL_SOCIAL_RE.match(text.strip()):
+            return OUT_OF_SCOPE_CONVERSATIONAL
         return OUT_OF_SCOPE_CASUAL
     if kind == "internal":
         return OUT_OF_SCOPE_INTERNAL
@@ -742,11 +782,12 @@ def _format_one_task_label(task: dict) -> str:
     return f"{course}: {title}"
 
 
-def execute(request: dict, db, user_id: str) -> dict:
+def execute(request: dict, db, user_id: str, text: str = "") -> dict:
     """
     Pure Python backend execution. The only source of academic/task facts.
     Returns a grounded result dict:
       {"kind": str, "text": str, "data": dict|None, "language": str, "no_timetable": bool}
+    `text` is the original user message, needed for context-sensitive static replies.
     Never raises.
     """
     intent = request.get("intent", "out_of_scope")
@@ -774,7 +815,11 @@ def execute(request: dict, db, user_id: str) -> dict:
             return result
 
         if intent in ("out_of_scope", "dashboard_required"):
-            result["text"] = _out_of_scope_reply(request)
+            # Pass the original text so _out_of_scope_reply can distinguish
+            # emotional messages from conversational social questions.
+            oos_kind = (request.get("out_of_scope") or {}).get("kind", "")
+            result["oos_kind"] = oos_kind
+            result["text"] = _out_of_scope_reply(request, text)
             return result
 
         if intent == "schedule_query":
@@ -822,6 +867,10 @@ def _containment_guard(llm_output: str, deterministic_text: str) -> bool:
     2. All time patterns (HH:MM) in LLM output are present in the deterministic text.
     3. Not suspiciously short compared to deterministic text (guards against truncation).
     """
+    if not llm_output or not llm_output.strip():
+        logger.warning("nlu.respond: containment guard tripped — empty or whitespace LLM output")
+        return False
+
     # DASHBOARD_URL containment rules
     if DASHBOARD_URL not in deterministic_text and DASHBOARD_URL in llm_output:
         logger.warning("nlu.respond: containment guard tripped — unnecessary dashboard URL added")
@@ -872,8 +921,13 @@ def respond(grounded: dict, db=None) -> str:
         return deterministic_text
 
     kind = grounded.get("kind", "")
-    if kind in ("save_task", "task_action", "_degraded", "out_of_scope", "greeting", "help"):
+    # Allow LLM #2 to rephrase casual/conversational out_of_scope so emotional
+    # messages feel more natural. All other oos sub-kinds remain static.
+    oos_kind = grounded.get("oos_kind", "")
+    if kind in ("save_task", "task_action", "_degraded", "greeting", "help"):
         return deterministic_text  # Static/sentinel — no point rephrasing
+    if kind == "out_of_scope" and oos_kind not in ("casual", "conversational"):
+        return deterministic_text  # Static redirect messages — don't rephrase
 
     if grounded.get("no_timetable"):
         return deterministic_text  # Guidance messages are precise; don't rephrase
@@ -938,6 +992,22 @@ def _fallback_handle(db, user_id: str, phone: str, text: str) -> dict:
             "intent": "dashboard_required",
         }
 
+    # Structural section-change detection (no LLM needed) — catches:
+    # "I want to change my section", "can I change my section?", "change my section"
+    _section_change_re = re.compile(
+        r"\b(?:change|update|set|switch|modify|different)\b.{0,25}\bsection\b"
+        r"|\bsection\b.{0,20}\b(?:change|update|set|switch)\b"
+        r"|\bcan\s+i\b.{0,30}\bsection\b"
+        r"|\bwant\b.{0,30}\bsection\b",
+        re.IGNORECASE,
+    )
+    if _section_change_re.search(text or ""):
+        return {
+            "action": "reply",
+            "text": "Sure — which section would you like to switch to?",
+            "intent": "section_set",
+        }
+
     try:
         from utils.agent import classify_intent, handle_agent_query  # type: ignore
         intent = classify_intent(text)
@@ -945,14 +1015,14 @@ def _fallback_handle(db, user_id: str, phone: str, text: str) -> dict:
             reply = handle_agent_query(db, user_id, phone, text, intent)
             return {"action": "reply", "text": reply, "intent": intent}
         if intent == "out_of_scope":
-            # Conversational fallback -- simple helpful response until LLM routing
-            # is enabled in Phase 1 and natural responses arrive in Phase 4.
+            # Use context-appropriate reply rather than a generic timetable redirect.
+            if _CONVERSATIONAL_PATTERNS.match((text or "").strip()):
+                reply_text = OUT_OF_SCOPE_CONVERSATIONAL
+            else:
+                reply_text = OUT_OF_SCOPE_CASUAL
             return {
                 "action": "reply",
-                "text": (
-                    "I'm here to help with your timetable and assignments! "
-                    "Try asking about your schedule or tasks."
-                ),
+                "text": reply_text,
                 "intent": "out_of_scope",
             }
     except Exception as exc:
@@ -1010,7 +1080,7 @@ def handle_message(db, user_id: str, phone: str, text: str) -> dict:
         if intent == "section_set":
             return _handle_section_set(db, user_id, phone, text, request, session)
 
-        grounded = execute(request, db, user_id)
+        grounded = execute(request, db, user_id, text=text)
         reply_text = respond(grounded, db=db)
 
         if intent == "task_query":

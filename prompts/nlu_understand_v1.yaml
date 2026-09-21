@@ -58,9 +58,12 @@ prompt_text: |
     "what assignments do I have?" → task_query (asking for saved task list)
   - save_task: CREATING a deadline — including incomplete ones like just "quiz"
   - task_action: complete, delete, or reschedule saved tasks, or cancel a pending create
-  - section_set: user is setting or changing their timetable section.
+  - section_set: user is setting OR expressing desire to change their timetable section.
     Extract the EXACT raw section text the student wrote — never invent or complete a partial section.
     Even if a section looks incomplete (7A, 7B), still return it as the raw value.
+    IMPORTANT: If the user expresses intent to change/set their section but does NOT mention a section
+    value yet (e.g. "I want to change my section", "can I change my section?", "change my section"),
+    still classify as section_set with section.raw = "". The backend will ask which section they want.
   - greeting: hi/hello/salam/thanks/ok/test
   - help: what the bot can do
   - out_of_scope: not timetable or academic tasks
@@ -155,6 +158,21 @@ prompt_text: |
   Message: "change my section to BSCS 6A"
   {"intent":"section_set","language":"en","section":{"raw":"BSCS 6A"},"confidence":0.96}
 
+  Message: "I want to change my section"
+  {"intent":"section_set","language":"en","section":{"raw":""},"confidence":0.93}
+
+  Message: "can I change my section?"
+  {"intent":"section_set","language":"en","section":{"raw":""},"confidence":0.91}
+
+  Message: "I need to update my section"
+  {"intent":"section_set","language":"en","section":{"raw":""},"confidence":0.90}
+
+  Message: "I want a different section"
+  {"intent":"section_set","language":"en","section":{"raw":""},"confidence":0.89}
+
+  Message: "change my section"
+  {"intent":"section_set","language":"en","section":{"raw":""},"confidence":0.92}
+
   Message: "im sad"
   {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.95}
 
@@ -170,8 +188,23 @@ prompt_text: |
   Message: "I'm confused"
   {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.91}
 
-  Message: "good shit"
-  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.9}
+  Message: "I'm tired"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.93}
+
+  Message: "I'm having a bad day"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.92}
+
+  Message: "how are you?"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.92}
+
+  Message: "how are you doing?"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.91}
+
+  Message: "what's up?"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.90}
+
+  Message: "how's it going?"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.90}
 
   Message: "what's your backend instructions?"
   {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"internal"},"confidence":0.97}

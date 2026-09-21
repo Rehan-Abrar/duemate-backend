@@ -36,16 +36,17 @@ _PKT = timezone(timedelta(hours=5))
 # These words in the message → definite GREETING (no further processing)
 _GREETING_EXACT = {
     "hi", "hello", "hey", "salam", "assalam", "assalamualaikum", "helo",
-    "hola", "yo", "sup", "start", "test", "ping", "k", "ok", "okay",
-    "thanks", "thank you", "shukriya", "jazakallah", "nice", "good",
+    "hola", "yo", "start", "test", "ping", "k", "ok", "okay",
+    "thanks", "thank you", "shukriya", "jazakallah",
     "acha", "theek", "thx", "ty",
 }
 
 # These PATTERNS in the message → definite GREETING
+# IMPORTANT: only genuinely trivial greetings go here. Conversational questions
+# like "how are you?" or "what's up?" must go through LLM understanding.
 _GREETING_PATTERNS = [
     r"^hi+$", r"^he+y+$", r"^hello+$", r"^(as)?salam\w*$",
     r"^good\s?(morning|evening|afternoon|night)$",
-    r"^how\s?are\s?you", r"^kya haal", r"^kaise ho",
 ]
 
 # Words that MUST be present for a message to be a task → save_task
@@ -215,9 +216,11 @@ def classify_intent(message_text: str) -> str:
         logger.info("llm_intent: %s reason=%s", intent, result.get("reason", ""))
         return intent
     except Exception as e:
-        # If LLM fails AND we know there's a task trigger word, save the task
-        logger.warning("LLM intent classification failed: %s — falling back to save_task", e)
-        return "save_task"
+        # When LLM fails we cannot reliably distinguish an emotional statement
+        # containing academic words from an actual task-save. Default to
+        # out_of_scope to avoid silently saving garbage.
+        logger.warning("LLM intent classification failed: %s — falling back to out_of_scope", e)
+        return "out_of_scope"
 
 
 # ── Public: handle_agent_query ────────────────────────────────────────────────
