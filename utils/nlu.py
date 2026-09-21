@@ -28,6 +28,7 @@ import textwrap
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from utils.config import DASHBOARD_URL
 from utils.groq_config import get_groq_model
 from utils.llm_client import complete_chat
 
@@ -40,7 +41,7 @@ _PKT = timezone(timedelta(hours=5))
 # Valid values for schema clamping (prevents unconstrained model output from leaking)
 _VALID_INTENTS = frozenset({
     "schedule_query", "task_query", "save_task", "task_action",
-    "greeting", "help", "out_of_scope",
+    "greeting", "help", "out_of_scope", "section_set", "dashboard_required",
 })
 _VALID_TASK_TYPES = frozenset({"quiz", "assignment", "project", "exam", "lab", "other"})
 _VALID_TASK_ACTIONS = frozenset({"complete", "delete", "reschedule", "cancel"})
@@ -54,7 +55,7 @@ _VALID_DAYS = frozenset({
 })
 _VALID_DUE = frozenset({"today", "tomorrow", "this_week", "overdue"})
 _VALID_LANGUAGES = frozenset({"en", "ur", "mixed"})
-_VALID_OOS_KINDS = frozenset({"casual", "internal", "unrelated"})
+_VALID_OOS_KINDS = frozenset({"casual", "internal", "unrelated", "dashboard_required"})
 _TIME_RE = re.compile(r"^\d{2}:\d{2}$")
 _OOS_TOPIC_RE = re.compile(r"^[a-z]+(?:[ -][a-z]+){0,2}$")
 # Genuine new-request cues — not course names. Used only to avoid treating
@@ -93,11 +94,11 @@ def _nlu_timeout() -> float:
 
 def routing_enabled() -> bool:
     """True when NLU_LLM_ROUTING_ENABLED is set to a truthy value."""
-    return os.getenv("NLU_LLM_ROUTING_ENABLED", "false").lower() in ("1", "true", "yes")
+    return os.getenv("NLU_LLM_ROUTING_ENABLED", "true").lower() in ("1", "true", "yes")
 
 def response_enabled() -> bool:
     """True when NLU_LLM_RESPONSE_ENABLED is set to a truthy value."""
-    return os.getenv("NLU_LLM_RESPONSE_ENABLED", "false").lower() in ("1", "true", "yes")
+    return os.getenv("NLU_LLM_RESPONSE_ENABLED", "true").lower() in ("1", "true", "yes")
 
 # ── Static replies (deterministic, no LLM) ───────────────────────────────────
 
@@ -140,6 +141,28 @@ OUT_OF_SCOPE_UNRELATED = (
     "I can help with your timetable and academic tasks, but I can't help with "
     "questions outside that."
 )
+DASHBOARD_REQUIRED_REPLY = (
+    "You'll need to do that from your DueMate dashboard. Open it here:\n"
+    f"{DASHBOARD_URL}"
+)
+
+_DASHBOARD_REQUIRED_RE = re.compile(
+    r"\b(?:upload|download|change|update|delete|manage|open|view)\b.{0,40}\b(?:timetable|pdf|file|university|degree|major|email|account|profile|dashboard)\b|"
+    r"\b(?:upload|download)\b.{0,20}\b(?:timetable|pdf|file)\b|"
+    r"\b(?:change|update)\b.{0,20}\b(?:university|degree|major|email|profile)\b|"
+    r"\b(?:delete|close)\b.{0,20}\b(?:account|profile)\b|"
+    r"\b(?:open|show|go\s+to)\b.{0,20}\b(?:dashboard|web\s+app)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_dashboard_required(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower().strip()
+    if "section" in t:
+        return False
+    return bool(_DASHBOARD_REQUIRED_RE.search(t))
 
 # ── Trivial-greeting fast path ────────────────────────────────────────────────
 # A TINY exact-match set used only for latency/cost, NOT as a meaning classifier.
@@ -236,9 +259,14 @@ def _sanitize_oos_topic(raw) -> Optional[str]:
 
 def _out_of_scope_reply(request: dict) -> str:
     """Deterministic reply from LLM #1's out_of_scope kind — no extra model call."""
+    intent = request.get("intent")
     oos = request.get("out_of_scope") or {}
     kind = oos.get("kind")
     topic = oos.get("topic")
+
+    if intent == "dashboard_required" or kind == "dashboard_required":
+        return DASHBOARD_REQUIRED_REPLY
+
     if kind == "casual":
         return OUT_OF_SCOPE_CASUAL
     if kind == "internal":
@@ -342,6 +370,11 @@ def _clamp_request(raw: dict) -> dict:
             "topic": _sanitize_oos_topic(oos.get("topic")),
         }
 
+    elif intent == "section_set":
+        sec = raw.get("section") or {}
+        raw_text = (sec.get("raw") or "").strip()
+        result["section"] = {"raw": raw_text}
+
     return result
 
 # ── LLM #1: understand ────────────────────────────────────────────────────────
@@ -402,6 +435,19 @@ def understand(text: str, db=None, session: Optional[dict] = None) -> dict:
 def _understand_user_content(text: str, session: Optional[dict]) -> str:
     parts = [f"Message: {text}"]
     session = session or {}
+    recent = session.get("recent_messages") or []
+    if recent:
+        context_lines = []
+        for msg in recent[-5:]:
+            u = msg.get("user") or ""
+            b = msg.get("bot") or ""
+            if u:
+                context_lines.append(f"User: {u}")
+            if b:
+                context_lines.append(f"Bot: {b}")
+        if context_lines:
+            parts.append("Recent conversation:\n" + "\n".join(context_lines))
+
     pending = session.get("pending_create")
     if pending:
         from utils.task_actions import deserialize_draft, missing_create_fields
@@ -425,6 +471,12 @@ def _understand_user_content(text: str, session: Optional[dict]) -> str:
     last_labels = session.get("last_task_labels") or []
     if last_labels:
         parts.append("Recently_listed_tasks: " + json.dumps(last_labels[:8], ensure_ascii=True))
+    pending_section = session.get("pending_section")
+    if pending_section:
+        parts.append("Pending_section: " + json.dumps({
+            "awaiting_program": True,
+            "raw_suffix": pending_section.get("raw_suffix", ""),
+        }, ensure_ascii=True))
     return "\n".join(parts)
 
 
@@ -721,7 +773,7 @@ def execute(request: dict, db, user_id: str) -> dict:
             result["text"] = ""
             return result
 
-        if intent == "out_of_scope":
+        if intent in ("out_of_scope", "dashboard_required"):
             result["text"] = _out_of_scope_reply(request)
             return result
 
@@ -747,6 +799,13 @@ def execute(request: dict, db, user_id: str) -> dict:
             result["data"] = request.get("task_action")
             return result
 
+        if intent == "section_set":
+            # Validation + DB write is in _handle_section_set; execute() just
+            # marks this as a section action so handle_message() can route it.
+            result["text"] = ""
+            result["kind"] = "section_set"
+            return result
+
     except Exception as exc:
         logger.warning("nlu.execute failed for intent=%s (%s)", intent, exc)
         result["text"] = "Something went wrong. Please try again in a moment."
@@ -763,7 +822,12 @@ def _containment_guard(llm_output: str, deterministic_text: str) -> bool:
     2. All time patterns (HH:MM) in LLM output are present in the deterministic text.
     3. Not suspiciously short compared to deterministic text (guards against truncation).
     """
-    if not llm_output or not llm_output.strip():
+    # DASHBOARD_URL containment rules
+    if DASHBOARD_URL not in deterministic_text and DASHBOARD_URL in llm_output:
+        logger.warning("nlu.respond: containment guard tripped — unnecessary dashboard URL added")
+        return False
+    if DASHBOARD_URL in deterministic_text and DASHBOARD_URL not in llm_output:
+        logger.warning("nlu.respond: containment guard tripped — dashboard URL omitted from output")
         return False
 
     # Extract time tokens from both
@@ -864,14 +928,33 @@ def _fallback_classify(text: str) -> str:
 def _fallback_handle(db, user_id: str, phone: str, text: str) -> dict:
     """
     Handle a message using the existing keyword-based classify_intent + handle_agent_query.
-    Used when LLM #1 is degraded. Returns the same {"action", "text"} shape.
+    Used when LLM #1 is degraded or routing is disabled.
+    Returns the same {"action", "text"} shape.
     """
+    if _is_dashboard_required(text):
+        return {
+            "action": "reply",
+            "text": DASHBOARD_REQUIRED_REPLY,
+            "intent": "dashboard_required",
+        }
+
     try:
         from utils.agent import classify_intent, handle_agent_query  # type: ignore
         intent = classify_intent(text)
         if intent in ("greeting", "query_schedule", "query_tasks"):
             reply = handle_agent_query(db, user_id, phone, text, intent)
             return {"action": "reply", "text": reply, "intent": intent}
+        if intent == "out_of_scope":
+            # Conversational fallback -- simple helpful response until LLM routing
+            # is enabled in Phase 1 and natural responses arrive in Phase 4.
+            return {
+                "action": "reply",
+                "text": (
+                    "I'm here to help with your timetable and assignments! "
+                    "Try asking about your schedule or tasks."
+                ),
+                "intent": "out_of_scope",
+            }
     except Exception as exc:
         logger.warning("nlu._fallback_handle failed (%s)", exc)
 
@@ -923,6 +1006,9 @@ def handle_message(db, user_id: str, phone: str, text: str) -> dict:
 
         if intent == "task_action":
             return _handle_task_action(db, user_id, phone, text, request, session)
+
+        if intent == "section_set":
+            return _handle_section_set(db, user_id, phone, text, request, session)
 
         grounded = execute(request, db, user_id)
         reply_text = respond(grounded, db=db)
@@ -1174,6 +1260,111 @@ def _handle_task_action(db, user_id, phone, text, request, session) -> dict:
     return {"action": "reply", "text": confirm_rescheduled(updated, due_date), "intent": "task_action"}
 
 
+
+def _handle_section_set(db, user_id: str, phone: str, text: str, request: dict, session: dict) -> dict:
+    """
+    Execute a section_set intent: validate the raw section text and either
+    save it (unambiguous full section) or ask for clarification (bare/partial).
+    Supports multi-turn clarification via pending_section session state.
+    """
+    from utils.nlu_session import save_nlu_session, clear_pending_section  # type: ignore
+    from utils.academic import validate_and_resolve_section  # type: ignore
+
+    raw_section = (request.get("section") or {}).get("raw", "").strip()
+
+    # --- Multi-turn: combine pending suffix with clarification program --------
+    pending_sec = (session or {}).get("pending_section") or {}
+    raw_suffix = pending_sec.get("raw_suffix", "")
+    if raw_suffix and raw_section:
+        # The user just sent the program name in response to our clarification.
+        # Combine: e.g. raw_suffix="7B" + raw_section="BSCS" -> try "BSCS-7B".
+        combined = f"{raw_section.upper()}-{raw_suffix.upper()}"
+        candidate = validate_and_resolve_section(combined, db)
+        if candidate["status"] == "valid":
+            raw_section = combined
+        else:
+            # Suffix alone as the new attempt
+            raw_section = raw_section  # keep what the user just said; validate below
+
+    if not raw_section:
+        return {"action": "reply", "text": "Which section would you like to set?", "intent": "section_set"}
+
+    result_check = validate_and_resolve_section(raw_section, db)
+
+    if result_check["status"] == "ambiguous":
+        options = result_check.get("available") or []
+        suffix = result_check.get("suffix", raw_section)
+        options_text = " or ".join(f"*{s}*" for s in options[:5])
+        if not options_text:
+            options_text = "e.g. BSCS-7A or BSSE-7A"
+        # Save pending state so the next message can be combined
+        save_nlu_session(
+            db, user_id, phone,
+            pending_section={"raw_suffix": suffix},
+            pending_create=(session or {}).get("pending_create"),
+            pending_action=(session or {}).get("pending_action"),
+            last_task_ids=(session or {}).get("last_task_ids") or [],
+            last_task_labels=(session or {}).get("last_task_labels") or [],
+        )
+        return {
+            "action": "reply",
+            "text": f"Which program is *{suffix}* for? For example, {options_text}.",
+            "intent": "section_set",
+        }
+
+    if result_check["status"] == "not_found":
+        clear_pending_section(db, user_id)
+        return {
+            "action": "reply",
+            "text": (
+                f"I couldn't find *{raw_section}* in the current timetable. "
+                f"{result_check.get('message', 'Please check the section name.') }"
+            ),
+            "intent": "section_set",
+        }
+
+    if result_check["status"] == "valid":
+        section = result_check["section"]
+        clear_pending_section(db, user_id)
+        # Persist to DB
+        if db is not None and user_id:
+            db.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"settings.timetable_section": section}},
+                upsert=True,
+            )
+            db.user_timetables.update_one(
+                {"user_id": user_id},
+                {"$set": {"selected_section": section}},
+                upsert=True,
+            )
+        # Build confirmation text
+        try:
+            from utils.academic import get_published_section_context  # type: ignore
+            from utils.rag import retrieve_schedule_context_structured  # type: ignore
+            ctx = get_published_section_context(db, section)
+            if ctx.get("status") == "ok":
+                next_result = retrieve_schedule_context_structured(
+                    {"query_type": "next_class"}, db, user_id
+                )
+                next_text = next_result.get("text", "")
+                if next_text:
+                    return {
+                        "action": "reply",
+                        "text": f"Done! You're set to *{section}*. \U0001f389\n\n{next_text}",
+                        "intent": "section_set",
+                    }
+        except Exception as exc:
+            logger.warning("section_set: next class lookup failed (%s)", exc)
+        return {
+            "action": "reply",
+            "text": f"Done! You're set to *{section}*. \U0001f389",
+            "intent": "section_set",
+        }
+
+    # Fallback (should not reach here)
+    return {"action": "reply", "text": "Something went wrong setting your section. Please try again.", "intent": "section_set"}
+
 def dispatch_message(db, user_id: str, phone: str, text: str, channel: str = None) -> dict:
     """
     Single AI entry point for WhatsApp and the web assistant.
@@ -1205,5 +1396,15 @@ def dispatch_message(db, user_id: str, phone: str, text: str, channel: str = Non
         request_id=str(uuid.uuid4()),
     ):
         if routing_enabled():
-            return handle_message(db, user_id, phone, text)
-        return _fallback_handle(db, user_id, phone, text)
+            result = handle_message(db, user_id, phone, text)
+        else:
+            result = _fallback_handle(db, user_id, phone, text)
+
+        if result and result.get("action") == "reply" and result.get("text"):
+            try:
+                from utils.nlu_session import append_to_recent_messages
+                append_to_recent_messages(db, user_id, text, result.get("text", ""))
+            except Exception as exc:
+                logger.warning("failed to append to recent_messages: %s", exc)
+
+        return result

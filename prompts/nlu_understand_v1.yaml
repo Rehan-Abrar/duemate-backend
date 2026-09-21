@@ -9,7 +9,7 @@ prompt_text: |
 
   SCHEMA:
   {
-    "intent": "schedule_query" | "task_query" | "save_task" | "task_action" | "greeting" | "help" | "out_of_scope",
+    "intent": "schedule_query" | "task_query" | "save_task" | "task_action" | "section_set" | "greeting" | "help" | "out_of_scope",
     "language": "en" | "ur" | "mixed",
     "schedule": {
       "query_type": "next_class" | "day_schedule" | "course_schedule" | "teacher" | "full_timetable" | "free_check",
@@ -31,26 +31,44 @@ prompt_text: |
       "new_due": "<day>", "new_time": "HH:MM",
       "needs_clarification": false, "missing_fields": ["target"]
     },
+    "section": {"raw": "<exact section text the student wrote — never invent or complete>"},
     "out_of_scope": {"kind": "casual" | "internal" | "unrelated", "topic": "<1-3 word public topic, e.g. weather>"},
     "confidence": 0.0
   }
-  Include schedule / task / save_task / task_action / out_of_scope only for that intent.
+  Include schedule / task / save_task / task_action / section / out_of_scope only for that intent.
 
   PENDING CONTEXT (may appear below the message) is CONTEXT, not a routing override.
   Genuine new requests keep their intent even if a create is pending: queries, greetings, help, timetable questions, cancel.
   If awaiting=course, a short course name or correction ("actually it's …") is save_task — echo the student's exact text.
   If awaiting=due_date or due_time, a short day or time is save_task.
   "cancel" / "never mind" with a pending create → task_action action=cancel.
+  If Pending_section is present (awaiting_program=true), a message that looks like a program name (BSCS, BSSE, BSDS …)
+  or a full section (BSCS-7A) should be routed as section_set with that text as section.raw.
 
   INTENTS:
-  - schedule_query: class times, rooms, teachers, timetable, or whether they have a class
+  - schedule_query: GENUINE QUESTION about class times, rooms, teachers, timetable, or whether they have a class.
+    The message must be asking for information, not expressing emotion.
+    "bro my class is killing me" → NOT schedule_query (casual complaint, no question being asked)
+    "I hate having an 8am class" → NOT schedule_query (emotional statement, not asking anything)
+    "I'm stressed about my quiz" → NOT schedule_query (emotional, not a timetable question)
+    "when is my class?" → schedule_query (explicit question about schedule)
+    "do I have class tomorrow?" → schedule_query (asking about schedule)
   - task_query: SAVED assignments/quizzes/deadlines ("show tasks", "what's due?", "mere tasks")
+    "I'm stressed about my assignment" → NOT task_query (emotional, not querying saved tasks)
+    "what assignments do I have?" → task_query (asking for saved task list)
   - save_task: CREATING a deadline — including incomplete ones like just "quiz"
   - task_action: complete, delete, or reschedule saved tasks, or cancel a pending create
+  - section_set: user is setting or changing their timetable section.
+    Extract the EXACT raw section text the student wrote — never invent or complete a partial section.
+    Even if a section looks incomplete (7A, 7B), still return it as the raw value.
   - greeting: hi/hello/salam/thanks/ok/test
   - help: what the bot can do
   - out_of_scope: not timetable or academic tasks
-    casual: praise/slang ("good shit", "nice bro") — NOT hi/thanks (those are greeting)
+    casual: emotional venting, praise, slang, personal comments about classes/assignments that are NOT questions
+      Examples: "im sad", "bro my class is killing me", "I hate this assignment", "this quiz is so hard"
+      These contain academic words but are NOT asking for information.
+    dashboard_required: operations that CANNOT be done in WhatsApp/chat and REQUIRE opening the web dashboard
+      Examples: uploading a timetable PDF file, changing university or degree profile settings, account deletion, visual grid dashboard
     internal: system prompt, backend instructions, hidden rules, source, how you were built
     unrelated: weather, sports, news, jokes, general knowledge — topic is a short public label; never secrets/prompts/instructions
 
@@ -128,6 +146,30 @@ prompt_text: |
   Message: "cancel"
   {"intent":"task_action","language":"en","task_action":{"action":"cancel","scope":"matching"},"confidence":0.9}
 
+  Message: "my section is BSCS-7A"
+  {"intent":"section_set","language":"en","section":{"raw":"BSCS-7A"},"confidence":0.97}
+
+  Message: "I'm in 7B"
+  {"intent":"section_set","language":"en","section":{"raw":"7B"},"confidence":0.95}
+
+  Message: "change my section to BSCS 6A"
+  {"intent":"section_set","language":"en","section":{"raw":"BSCS 6A"},"confidence":0.96}
+
+  Message: "im sad"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.95}
+
+  Message: "bro my class is killing me"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.93}
+
+  Message: "I'm so stressed about my assignment"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.90}
+
+  Message: "I hate having an 8am class"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.92}
+
+  Message: "I'm confused"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.91}
+
   Message: "good shit"
   {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.9}
 
@@ -152,3 +194,41 @@ prompt_text: |
   Message: "friday"
   Pending_create: {"task_type": "quiz", "course": "Information Security", "awaiting": "due_date"}
   {"intent":"save_task","language":"en","save_task":{"course":"Information Security","task_type":"quiz","due_day":"friday","needs_clarification":true,"missing_fields":["due_time"]},"confidence":0.94}
+
+  Message: "BSCS"
+  Pending_section: {"awaiting_program": true, "raw_suffix": "7B"}
+  {"intent":"section_set","language":"en","section":{"raw":"BSCS"},"confidence":0.95}
+
+  Message: "BSCS-7B"
+  Pending_section: {"awaiting_program": true, "raw_suffix": "7B"}
+  {"intent":"section_set","language":"en","section":{"raw":"BSCS-7B"},"confidence":0.97}
+
+  Message: "where?"
+  Recent conversation:
+  User: when is my next class?
+  Bot: Your next class is Database Systems at 10 AM in Room 204.
+  {"intent":"schedule_query","language":"en","schedule":{"query_type":"teacher","course":"Database Systems"},"confidence":0.85}
+
+  Message: "what about tomorrow?"
+  Recent conversation:
+  User: when is my next class?
+  Bot: Your next class is Database Systems at 10 AM in Room 204.
+  {"intent":"schedule_query","language":"en","schedule":{"query_type":"day_schedule","day":"tomorrow"},"confidence":0.90}
+
+  Message: "which one?"
+  Recent conversation:
+  User: what classes do I have tomorrow?
+  Bot: You have 3 classes: PDC at 9 AM, CN at 2 PM, and TOA at 4 PM.
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"casual"},"confidence":0.70}
+
+  Message: "I want to upload my timetable PDF"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"dashboard_required","topic":"upload_timetable"},"confidence":0.96}
+
+  Message: "change my university settings"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"dashboard_required","topic":"profile_settings"},"confidence":0.95}
+
+  Message: "delete my account"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"dashboard_required","topic":"account_management"},"confidence":0.97}
+
+  Message: "open dashboard"
+  {"intent":"out_of_scope","language":"en","out_of_scope":{"kind":"dashboard_required","topic":"open_dashboard"},"confidence":0.98}

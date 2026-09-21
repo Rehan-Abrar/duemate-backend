@@ -341,3 +341,127 @@ def message_for_status(status: str, section: Optional[str] = None) -> str:
         status, "I don't know your section yet. Please pick your section from the dashboard."
     )
 
+
+def validate_and_resolve_section(raw_text: str, db) -> dict:
+    """
+    Validate a raw section identifier against actual timetable data.
+
+    Returns:
+        {
+            "status": "valid" | "ambiguous" | "not_found",
+            "section": str | None,    # resolved canonical label (only when valid)
+            "suffix": str,            # the bare suffix (e.g. "7A") used in replies
+            "message": str,           # human-readable status detail
+            "available": list[str],   # matching options (ambiguous / not_found)
+        }
+
+    Rules:
+        - Bare identifiers (7A, 7B, 6A) are ALWAYS ambiguous, even when only one
+          program has that section. The user must supply the program prefix.
+        - Only fully explicit identifiers (BSCS-7A, BSCS 7A) are validated directly.
+        - The section must exist in at least one currently published official timetable.
+    """
+    raw = (raw_text or "").strip()
+    if not raw:
+        return {
+            "status": "not_found",
+            "section": None,
+            "suffix": raw,
+            "message": "Please provide a section name.",
+            "available": [],
+        }
+
+    normalized = normalize_requested_section(raw)
+
+    # ── Bare identifier (no program prefix) — ALWAYS ambiguous ────────────────
+    # A bare suffix is any string that normalize_requested_section() cannot
+    # resolve to a full program+section label (e.g. "7A", "7B", "6A").
+    if not normalized:
+        # Try to extract the suffix for matching (e.g. "7A" from "7A" or "section 7A")
+        suffix_match = re.search(r"\b(\d+[A-Za-z]?)\b", raw)
+        suffix = suffix_match.group(1).upper() if suffix_match else raw.upper()
+
+        if db is not None:
+            # Find all sections that end with this suffix across all published timetables
+            pipeline = [
+                {"$match": {"status": "published"}},
+                {"$project": {"detected_sections": 1}},
+            ]
+            available = []
+            for doc in db.official_timetables.aggregate(pipeline):
+                for sec in (doc.get("detected_sections") or []):
+                    if isinstance(sec, str) and sec.upper().endswith(f"-{suffix}"):
+                        if sec not in available:
+                            available.append(sec)
+            available.sort()
+        else:
+            available = []
+
+        return {
+            "status": "ambiguous",
+            "section": None,
+            "suffix": suffix,
+            "message": (
+                f"'{suffix}' is ambiguous — please include the program prefix, "
+                f"e.g. BSCS-{suffix}."
+            ),
+            "available": available,
+        }
+
+    # ── Full section — look up in published timetables ────────────────────────
+    if db is None:
+        return {
+            "status": "not_found",
+            "section": None,
+            "suffix": normalized,
+            "message": "Database unavailable.",
+            "available": [],
+        }
+
+    now = _utc_now()
+    doc = db.official_timetables.find_one(
+        {
+            "status": "published",
+            "detected_sections": normalized,
+            "effective_from": {"$lte": now},
+            "$or": [{"effective_to": None}, {"effective_to": {"$gt": now}}],
+        },
+        {"detected_sections": 1, "_id": 0},
+    )
+
+    if doc:
+        return {
+            "status": "valid",
+            "section": normalized,
+            "suffix": normalized,
+            "message": f"Section {normalized} found.",
+            "available": [],
+        }
+
+    # Not found — suggest nearby sections from the same program prefix
+    program = re.match(r"^([A-Z]+)", normalized)
+    program_prefix = program.group(1) if program else None
+    available = []
+    if program_prefix:
+        for d in db.official_timetables.find(
+            {"status": "published"},
+            {"detected_sections": 1, "_id": 0},
+        ):
+            for sec in (d.get("detected_sections") or []):
+                if isinstance(sec, str) and sec.upper().startswith(program_prefix) and sec not in available:
+                    available.append(sec)
+        available.sort()
+
+    return {
+        "status": "not_found",
+        "section": None,
+        "suffix": normalized,
+        "message": (
+            f"I couldn't find *{normalized}* in the current timetable."
+            + (
+                f" Available {program_prefix} sections: {', '.join(available[:8])}."
+                if available else ""
+            )
+        ),
+        "available": available[:8],
+    }

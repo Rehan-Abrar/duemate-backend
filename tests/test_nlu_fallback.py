@@ -34,9 +34,9 @@ from utils.agent import classify_intent
 # ── routing_enabled flag ──────────────────────────────────────────────────────
 
 class TestRoutingFlag:
-    def test_default_is_false(self, monkeypatch):
+    def test_default_is_true(self, monkeypatch):
         monkeypatch.delenv("NLU_LLM_ROUTING_ENABLED", raising=False)
-        assert routing_enabled() is False
+        assert routing_enabled() is True
 
     def test_set_to_true(self, monkeypatch):
         monkeypatch.setenv("NLU_LLM_ROUTING_ENABLED", "true")

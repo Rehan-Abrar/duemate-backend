@@ -70,10 +70,51 @@ def clear_pending_action(db, user_id: Optional[str]) -> None:
     )
 
 
+def clear_pending_section(db, user_id: Optional[str]) -> None:
+    """Clear a pending section-clarification flow."""
+    if db is None or not user_id:
+        return
+    db.nlu_sessions.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "pending_section": None,
+            "updated_at": _utc_now(),
+        }},
+    )
+
+
 def clear_nlu_session(db, user_id: Optional[str]) -> None:
     if db is None or not user_id:
         return
     db.nlu_sessions.delete_many({"user_id": user_id})
+
+
+def append_to_recent_messages(db, user_id: Optional[str], user_text: str, bot_text: str, max_messages: int = 5) -> None:
+    """Append the latest exchange to the session's recent_messages list."""
+    if db is None or not user_id:
+        return
+    now = _utc_now()
+    exchange = {
+        "user": user_text[:500] if user_text else "",
+        "bot": bot_text[:500] if bot_text else "",
+        "at": now,
+    }
+    db.nlu_sessions.update_one(
+        {"user_id": user_id},
+        {
+            "$push": {
+                "recent_messages": {
+                    "$each": [exchange],
+                    "$slice": -max_messages,
+                }
+            },
+            "$set": {
+                "updated_at": now,
+                "expires_at": now + timedelta(minutes=SESSION_TTL_MINUTES),
+            },
+        },
+        upsert=True,
+    )
 
 
 def ensure_nlu_session_index(db) -> None:

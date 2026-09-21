@@ -67,25 +67,34 @@ _MY_TASKS_WORDS = {
     "tasks do i", "what homework", "what quiz", "what assignment",
 }
 
-# Keywords that signal a schedule / timetable question.
-# NOTE: these are generic schedule vocabulary only — no course-specific terms
-# (e.g. "pdc class") so the classifier works for any program/semester/section.
-_SCHEDULE_WORDS = {
-    "who teaches", "who is the teacher", "teacher", "instructor", "teaches",
-    "sir", "ma'am", "madam", "prof", "professor", "lecture", "class", "classes",
-    "timetable", "schedule", "timing", "when is", "where is", "room",
-    "lab room", "next class", "today class", "what time", "kab hai",
-    "kahan hai", "which room", "which class", "agli class", "agle class", "aaj class",
+# Multi-word phrases that UNAMBIGUOUSLY signal a schedule query when seen as a
+# substring. These are kept short and structural — never single academic words
+# that could appear in casual speech ("my class is killing me").
+_SCHEDULE_EXPLICIT_PHRASES = {
+    "who teaches", "who is the teacher", "who is my teacher",
+    "next class", "today class", "aaj class", "agli class", "agle class",
+    "timetable", "my schedule",
+    "kab hai", "kahan hai",
+    "which room", "lab room",
+    "show my timetable", "show timetable",
 }
 
-# Generic patterns that strongly signal a schedule question (no hardcoded courses).
-_SCHEDULE_ENTITY_PATTERNS = [
-    r"\bwho\b.*(teach|sir|madam|prof|instructor)",
-    r"\bwhen\b.*(class|lecture|lab|session)",
-    r"\bwhere\b.*(class|lab|room)",
-    r"\b(teaches?|instructor)\b",
-    r"next class",
-    r"(aaj|kal|monday|tuesday|wednesday|thursday|friday).*(class|schedule|lecture|lab)",
+# Patterns that unambiguously signal a schedule question (require pairing).
+# Rule: MUST contain an explicit query signal (who/when/where/do i have) COMBINED
+# with an academic structure word. Single academic words in isolation do NOT match.
+_SCHEDULE_QUERY_PATTERNS = [
+    r"\bwho\b.{0,30}\b(teach|teaches|instructor|sir|madam|prof|professor)\b",
+    r"\bwhen\b.{0,30}\b(class|lecture|lab|session|schedule)\b",
+    r"\bwhere\b.{0,30}\b(class|lab|room|lecture)\b",
+    r"\bwhat\s+time\b.{0,30}\b(class|lecture|lab)\b",
+    r"\bdo\s+i\s+have\b.{0,20}\b(class|lecture|lab|session)\b",
+    r"\bhow\s+long.{0,20}\b(class|lecture|lab)\b",
+    r"\b(shows?|list|display)\b.{0,20}\b(timetable|schedule|classes|lectures)\b",
+    r"\b(aaj|kal|monday|tuesday|wednesday|thursday|friday)\b.{0,30}\b(class|schedule|lecture|lab|koi)\b",
+    r"\bkya\b.{0,20}\b(class|lecture|lab)\b.{0,20}\b(hai|hain)\b",
+    r"\bmera\b.{0,20}\b(timetable|schedule)\b",
+    r"\b(free|khali)\b.{0,20}\b(hoon|hun|hai|am\s+i)\b",
+    r"\bam\s+i\s+free\b",
 ]
 
 
@@ -107,13 +116,21 @@ def _is_greeting(text: str) -> bool:
 
 
 def _is_schedule_query(text: str) -> bool:
+    """
+    Returns True only when the message UNAMBIGUOUSLY asks about schedule.
+
+    Requires explicit query signals paired with academic vocabulary.
+    Single academic words ('class', 'teacher', 'schedule') in casual sentences
+    do NOT match — that distinction belongs to the LLM (Phase 1+).
+    This is a fast-path optimizer for obvious queries, not a meaning classifier.
+    """
     t = _normalize(text)
-    # Keyword match
-    if any(kw in t for kw in _SCHEDULE_WORDS):
+    # Explicit multi-word phrase match (structural, not single vocab words)
+    if any(phrase in t for phrase in _SCHEDULE_EXPLICIT_PHRASES):
         return True
-    # Regex entity patterns
-    for pattern in _SCHEDULE_ENTITY_PATTERNS:
-        if re.search(pattern, t):
+    # Pattern match — all patterns require a query verb + academic noun pairing
+    for pattern in _SCHEDULE_QUERY_PATTERNS:
+        if re.search(pattern, t, re.IGNORECASE):
             return True
     return False
 
@@ -149,7 +166,7 @@ def _call_groq(system_prompt: str, user_prompt: str, json_format: bool = False) 
 def classify_intent(message_text: str) -> str:
     """
     Classify incoming WhatsApp message intent.
-    Returns: 'save_task' | 'query_schedule' | 'query_tasks' | 'greeting'
+    Returns: 'save_task' | 'query_schedule' | 'query_tasks' | 'greeting' | 'out_of_scope'
 
     Priority order:
       1. Deterministic pre-filter (instant, no API call)
@@ -168,12 +185,11 @@ def classify_intent(message_text: str) -> str:
         logger.info("deterministic_intent: query_tasks text=%r", message_text[:50])
         return "query_tasks"
 
-    # If no task-trigger word at all, it's very unlikely to be a task.
-    # Treat as a schedule query so it goes to the agent (which can explain
-    # it doesn't understand) rather than silently saving garbage to the DB.
+    # If no task-trigger word at all, it's not a task — let it fall through to
+    # the LLM (NLU pipeline) rather than forcing it into the schedule engine.
     if not _has_task_trigger(message_text):
-        logger.info("deterministic_intent: no_task_trigger → query_schedule text=%r", message_text[:50])
-        return "query_schedule"
+        logger.info("deterministic_intent: no_task_trigger → out_of_scope text=%r", message_text[:50])
+        return "out_of_scope"
 
     # ── STEP 2: LLM classifier (only for ambiguous task-like messages) ────────
     system_prompt = (
@@ -194,7 +210,7 @@ def classify_intent(message_text: str) -> str:
         response_text = _call_groq(system_prompt, f"Message: {message_text}", json_format=True)
         result = json.loads(response_text)
         intent = result.get("intent", "save_task")
-        if intent not in ("save_task", "query_schedule", "query_tasks", "greeting"):
+        if intent not in ("save_task", "query_schedule", "query_tasks", "greeting", "out_of_scope"):
             intent = "save_task"
         logger.info("llm_intent: %s reason=%s", intent, result.get("reason", ""))
         return intent

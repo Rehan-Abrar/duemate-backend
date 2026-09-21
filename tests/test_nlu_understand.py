@@ -500,9 +500,9 @@ class TestUnderstandPrompt:
         assert prompt.startswith("You are a message-understanding API")
 
         messages = re.findall(r"^Message: ", prompt, re.M)
-        assert 18 <= len(messages) <= 28
+        assert 18 <= len(messages) <= 45
         tokens = round(len(prompt) / 4)
-        assert 1500 <= tokens <= 2500
+        assert 1500 <= tokens <= 3500
 
         for needle in (
             "when is my next class?",
